@@ -1,5 +1,6 @@
 from functools import wraps
 import os
+import signal
 from time import time
 from typing import List
 
@@ -11,6 +12,18 @@ from eudoxia.workload.csv_io import (
     WorkloadTraceGenerator,
     CSVWorkloadReader,
 )
+
+# Timeout for a single simulation run (in seconds)
+SIMULATION_TIMEOUT = 180  # 3 minutes per file — healthy sims finish in 2-6s each
+
+
+class SimulationTimeoutError(Exception):
+    """Raised when a single simulation exceeds the time limit."""
+    pass
+
+
+def _timeout_handler(signum, frame):
+    raise SimulationTimeoutError("Simulation exceeded timeout limit")
 
 
 test_policy_as_string = """
@@ -90,21 +103,36 @@ def generate_trace_file(params, output_file):
 def run_simulation_with_trace(params, trace_file):
     """Run simulation using a trace file.
 
-    Returns None if no containers complete (which causes percentile calculation to fail).
+    Returns None if no containers complete (which causes percentile calculation to fail),
+    or if the simulation exceeds the timeout limit.
     """
     with open(trace_file) as f:
         reader = CSVWorkloadReader(f)
         workload = reader.get_workload(params["ticks_per_second"])
+        # Set up timeout using signal alarm
+        old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+        signal.alarm(SIMULATION_TIMEOUT)
         try:
-            return run_simulator(params, workload=workload)
+            result = run_simulator(params, workload=workload)
+            signal.alarm(0)  # Cancel the alarm on success
+            return result
+        except SimulationTimeoutError:
+            import logging
+            logging.getLogger(__name__).warning(
+                f"⏰ Simulation timed out after {SIMULATION_TIMEOUT}s for {trace_file}, skipping"
+            )
+            return None
         except IndexError as e:
+            signal.alarm(0)  # Cancel the alarm
             # This happens when no containers complete (empty container_tick_times)
             import logging
-
             logging.getLogger(__name__).warning(
                 f"No containers completed in {trace_file}, skipping: {e}"
             )
             return None
+        finally:
+            signal.alarm(0)  # Ensure alarm is always cancelled
+            signal.signal(signal.SIGALRM, old_handler)  # Restore original handler
 
 
 @timing
@@ -144,11 +172,16 @@ def get_raw_stats_for_policy(
     params = base_params.copy()
     params["scheduler_algo"] = policy_algorithm
     # Run sequentially in this process to preserve scheduler registrations from exec()
-    all_stats = [
-        run_simulation_with_trace(params, trace_file) for trace_file in trace_files
-    ]
-    # Filter out None results (from simulations where no containers completed)
-    stats = [s for s in all_stats if s is not None]
+    stats = []
+    for trace_file in trace_files:
+        s = run_simulation_with_trace(params, trace_file)
+        if s is None:
+            # Short-circuit: if one simulation fails or times out, the whole policy is doomed
+            # to fail the length check later. Stop wasting time on remaining trace files.
+            import logging
+            logging.getLogger(__name__).warning("Simulation failed/timed out. Short-circuiting remaining traces.")
+            break
+        stats.append(s)
     return stats
 
 

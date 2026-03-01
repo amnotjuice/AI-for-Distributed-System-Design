@@ -110,6 +110,7 @@ def generate_policy_with_llm(
     feedback_history,
     model,
     temperature,
+    reasoning_effort_override=None,
 ):
     """Use LLM to generate a new policy based on context and request
 
@@ -120,6 +121,7 @@ def generate_policy_with_llm(
                          representing previous attempts and their outcomes
         model: The LLM model to use for generation
         temperature: Temperature parameter for LLM sampling
+        reasoning_effort_override: Optional reasoning effort override
 
     Returns:
         tuple: (generated_content, messages, llm_params) where:
@@ -151,8 +153,10 @@ def generate_policy_with_llm(
             # Add user's feedback
             messages.append({"role": "user", "content": entry["feedback"]})
 
-    reasoning_effort = None
-    if model.startswith("gpt-5") or model.startswith("claude-opus-4"):
+    reasoning_effort = reasoning_effort_override
+    if reasoning_effort is None and (
+        model.startswith("gpt-5") or model.startswith("claude-opus-4")
+    ):
         # leverage advanced capabilities and override the reasoning effort
         reasoning_effort = "high"
         temperature = 1
@@ -176,7 +180,13 @@ def generate_policy_with_llm(
 
 
 def generate_policy(
-    user_request, feedback_history, model, temperature, policy_key, verbose=False
+    user_request,
+    feedback_history,
+    model,
+    temperature,
+    policy_key,
+    verbose=False,
+    reasoning_effort_override=None,
 ):
     """Generate a policy using LLM.
 
@@ -193,6 +203,7 @@ def generate_policy(
         model: The LLM model to use for generation
         temperature: Temperature parameter for LLM sampling
         policy_key: The policy key to use for registering the scheduler
+        reasoning_effort_override: Optional reasoning effort override
 
     Returns:
         dict: Dictionary containing:
@@ -225,7 +236,12 @@ def generate_policy(
             print(f"Using feedback from {len(feedback_history)} previous attempt(s)")
 
     generated_code, llm_messages, llm_params = generate_policy_with_llm(
-        user_request, system_context, feedback_history, model, temperature
+        user_request,
+        system_context,
+        feedback_history,
+        model,
+        temperature,
+        reasoning_effort_override=reasoning_effort_override,
     )
 
     # Clean the code
