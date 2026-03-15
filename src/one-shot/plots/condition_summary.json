@@ -1,0 +1,82 @@
+[
+  {
+    "condition_id": "effort_none",
+    "temperature": 1.0,
+    "reasoning_effort": "none",
+    "n_trials": 50,
+    "functional_successes": 32,
+    "better_than_baseline_successes": 32,
+    "functional_mean": 0.64,
+    "functional_wilson_95_low": 0.5014076201030195,
+    "functional_wilson_95_high": 0.7586143703281711,
+    "beat_baseline_mean": 0.64,
+    "beat_baseline_wilson_95_low": 0.5014076201030195,
+    "beat_baseline_wilson_95_high": 0.7586143703281711,
+    "mean_llm_wait_seconds": 41.1104,
+    "failure_mode_counts": {
+      "success": 32,
+      "simulation_error": 11,
+      "simulation_timeout": 7
+    }
+  },
+  {
+    "condition_id": "effort_low",
+    "temperature": 1.0,
+    "reasoning_effort": "low",
+    "n_trials": 50,
+    "functional_successes": 36,
+    "better_than_baseline_successes": 35,
+    "functional_mean": 0.72,
+    "functional_wilson_95_low": 0.5833461285401034,
+    "functional_wilson_95_high": 0.8252598564231963,
+    "beat_baseline_mean": 0.7,
+    "beat_baseline_wilson_95_low": 0.562493877226366,
+    "beat_baseline_wilson_95_high": 0.8089661091039063,
+    "mean_llm_wait_seconds": 47.1096,
+    "failure_mode_counts": {
+      "simulation_error": 9,
+      "success": 36,
+      "simulation_timeout": 5
+    }
+  },
+  {
+    "condition_id": "effort_medium",
+    "temperature": 1.0,
+    "reasoning_effort": "medium",
+    "n_trials": 50,
+    "functional_successes": 35,
+    "better_than_baseline_successes": 32,
+    "functional_mean": 0.7,
+    "functional_wilson_95_low": 0.562493877226366,
+    "functional_wilson_95_high": 0.8089661091039063,
+    "beat_baseline_mean": 0.64,
+    "beat_baseline_wilson_95_low": 0.5014076201030195,
+    "beat_baseline_wilson_95_high": 0.7586143703281711,
+    "mean_llm_wait_seconds": 91.9526,
+    "failure_mode_counts": {
+      "success": 35,
+      "simulation_error": 6,
+      "simulation_timeout": 9
+    }
+  },
+  {
+    "condition_id": "effort_high",
+    "temperature": 1.0,
+    "reasoning_effort": "high",
+    "n_trials": 50,
+    "functional_successes": 37,
+    "better_than_baseline_successes": 37,
+    "functional_mean": 0.74,
+    "functional_wilson_95_low": 0.6044657801100008,
+    "functional_wilson_95_high": 0.8412862034863262,
+    "beat_baseline_mean": 0.74,
+    "beat_baseline_wilson_95_low": 0.6044657801100008,
+    "beat_baseline_wilson_95_high": 0.8412862034863262,
+    "mean_llm_wait_seconds": 147.6274,
+    "failure_mode_counts": {
+      "success": 37,
+      "simulation_error": 7,
+      "simulation_timeout": 6
+    }
+  }
+]

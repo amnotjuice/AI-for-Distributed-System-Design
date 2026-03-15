@@ -14,12 +14,30 @@ from eudoxia.workload.csv_io import (
 )
 
 # Timeout for a single simulation run (in seconds)
-SIMULATION_TIMEOUT = 180  # 3 minutes per file — healthy sims finish in 2-6s each
+SIMULATION_TIMEOUT = 60  # 60s per trace — covers 95th percentile; outliers beyond this are impractical
+LAST_SIMULATION_FAILURE = None
 
 
 class SimulationTimeoutError(Exception):
     """Raised when a single simulation exceeds the time limit."""
     pass
+
+
+def _set_last_failure(reason: str, trace_file: str, detail: str):
+    global LAST_SIMULATION_FAILURE
+    LAST_SIMULATION_FAILURE = {
+        "reason": reason,
+        "trace_file": trace_file,
+        "detail": detail,
+        "timeout_seconds": SIMULATION_TIMEOUT if reason == "timeout" else None,
+    }
+
+
+def get_last_simulation_failure() -> dict | None:
+    """Return details of the most recent per-trace simulation failure."""
+    if LAST_SIMULATION_FAILURE is None:
+        return None
+    return LAST_SIMULATION_FAILURE.copy()
 
 
 def _timeout_handler(signum, frame):
@@ -109,30 +127,37 @@ def run_simulation_with_trace(params, trace_file):
     with open(trace_file) as f:
         reader = CSVWorkloadReader(f)
         workload = reader.get_workload(params["ticks_per_second"])
-        # Set up timeout using signal alarm
         old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
         signal.alarm(SIMULATION_TIMEOUT)
         try:
             result = run_simulator(params, workload=workload)
-            signal.alarm(0)  # Cancel the alarm on success
             return result
         except SimulationTimeoutError:
+            _set_last_failure(
+                reason="timeout",
+                trace_file=trace_file,
+                detail=f"Exceeded {SIMULATION_TIMEOUT}s per-trace limit",
+            )
             import logging
             logging.getLogger(__name__).warning(
-                f"⏰ Simulation timed out after {SIMULATION_TIMEOUT}s for {trace_file}, skipping"
+                f"Simulation timed out on {trace_file} after {SIMULATION_TIMEOUT}s"
             )
             return None
         except IndexError as e:
-            signal.alarm(0)  # Cancel the alarm
             # This happens when no containers complete (empty container_tick_times)
+            _set_last_failure(
+                reason="no_completed_containers",
+                trace_file=trace_file,
+                detail=str(e),
+            )
             import logging
             logging.getLogger(__name__).warning(
                 f"No containers completed in {trace_file}, skipping: {e}"
             )
             return None
         finally:
-            signal.alarm(0)  # Ensure alarm is always cancelled
-            signal.signal(signal.SIGALRM, old_handler)  # Restore original handler
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old_handler)
 
 
 @timing
@@ -171,11 +196,19 @@ def get_raw_stats_for_policy(
     """
     params = base_params.copy()
     params["scheduler_algo"] = policy_algorithm
+    global LAST_SIMULATION_FAILURE
+    LAST_SIMULATION_FAILURE = None
     # Run sequentially in this process to preserve scheduler registrations from exec()
     stats = []
     for trace_file in trace_files:
         s = run_simulation_with_trace(params, trace_file)
         if s is None:
+            if LAST_SIMULATION_FAILURE is None:
+                _set_last_failure(
+                    reason="unknown",
+                    trace_file=trace_file,
+                    detail="run_simulation_with_trace returned None without explicit reason",
+                )
             # Short-circuit: if one simulation fails or times out, the whole policy is doomed
             # to fail the length check later. Stop wasting time on remaining trace files.
             import logging
