@@ -47,7 +47,7 @@ CANONICAL_SIM_PARAMS = {
     "batch_prob": 0.6,
     "random_seed": 42,
     "per_trace_timeout": None,
-    "subprocess_timeout": 700,
+    "subprocess_timeout": None,
     # Max job time = 6 minutes
     "max_job_time": 360,
 }

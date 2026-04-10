@@ -298,8 +298,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--exp", default="reasoning", choices=["reasoning", "estimation", "two_iter"],
                         help="Experiment type (default: reasoning)")
-    parser.add_argument("--effort", default="medium", choices=SUPPORTED_EFFORTS,
-                        help="Reasoning effort level (default: medium)")
+    parser.add_argument("--effort", default="low", choices=SUPPORTED_EFFORTS,
+                        help="Reasoning effort level (default: low)")
     parser.add_argument("--n", type=int, default=50)
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--verbose", "-v", action="store_true")

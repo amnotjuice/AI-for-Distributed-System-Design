@@ -34,7 +34,6 @@ os.environ.setdefault("LITELLM_LOG", "ERROR")
 logging.getLogger("eudoxia").setLevel(logging.CRITICAL)
 
 from spring2026.tool.config import (
-    CANONICAL_SIM_PARAMS,
     ESTIMATOR_CONDITIONS,
     EXPERIMENTS,
     RESULTS_DIR,
@@ -212,7 +211,7 @@ def evaluate(filepath: Path, trace_files: list[str], baseline_median: float, met
         "--worker",
         str(filepath), json.dumps(trace_files), str(baseline_median), metric, json.dumps(base_params),
     ]
-    subprocess_timeout = base_params.get("subprocess_timeout", 700)
+    subprocess_timeout = base_params.get("subprocess_timeout", None)
     try:
         result = subprocess.run(cmd, capture_output=True, text=True,
                                 cwd=str(_SRC), timeout=subprocess_timeout)

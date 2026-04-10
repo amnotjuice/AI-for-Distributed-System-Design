@@ -10,7 +10,6 @@ Uses iterate_once() from tool/iterate_once.py, same as iterate-study/generate.py
 
 PARAM_OVERRIDES = {
     "per_trace_timeout": None,
-    "subprocess_timeout": 600,
 }
 
 SOURCE_EXPERIMENT = "01_reasoning"

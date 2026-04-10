@@ -11,7 +11,6 @@ consistent with one-shot-est/config.py.
 
 PARAM_OVERRIDES = {
     "per_trace_timeout": None,
-    "subprocess_timeout": 600,
 }
 
 N_SCHEDULERS = 50

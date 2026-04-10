@@ -8,7 +8,6 @@ Fig 5 from the paper.
 
 PARAM_OVERRIDES = {
     "per_trace_timeout": None,
-    "subprocess_timeout": 600,
 }
 
 # Simulation fidelity conditions to sweep

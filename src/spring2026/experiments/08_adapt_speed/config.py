@@ -9,7 +9,6 @@ Fig 8 from the paper.
 
 PARAM_OVERRIDES = {
     "per_trace_timeout": None,
-    "subprocess_timeout": 600,
 }
 
 N_SCENARIOS = 10

@@ -8,7 +8,6 @@ Fig 4 from the paper.
 
 PARAM_OVERRIDES = {
     "per_trace_timeout": None,
-    "subprocess_timeout": 600,
 }
 
 SOURCE_EXPERIMENT = "01_reasoning"
