@@ -62,7 +62,7 @@ def main() -> None:
         with open(trace_file) as f:
             reader = CSVWorkloadReader(f)
             workload = reader.get_workload(params["ticks_per_second"])
-        stats = run_simulator(params, workload=workload)
+            stats = run_simulator(params, workload=workload)
         print("__RESULT__" + json.dumps({"ok": True, "latency": stats.adjusted_latency()}))
     except Exception as exc:
         print("__RESULT__" + json.dumps({"ok": False, "error": str(exc)}))

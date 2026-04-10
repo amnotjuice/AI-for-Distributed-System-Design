@@ -35,6 +35,52 @@ import statements inside the function itself, should they be needed.
 Do NOT generate your own poliy key - you MUST use exactly what is provided in the user request.
 """
 
+ITERATION_SYSTEM_PROMPT = """{context}
+
+## Scheduler Registration
+
+Every scheduler must register two functions using decorators:
+
+@register_scheduler_init(key="myscheduler")
+def init(s):
+    s.queue = []  # s also has s.executor, s.params
+
+@register_scheduler(key="myscheduler")
+def schedule(s, results, pipelines):
+    suspensions = []
+    assignments = []
+    return suspensions, assignments
+
+## Operator State Machine
+
+PENDING -> ASSIGNED -> RUNNING -> COMPLETED; FAILED -> ASSIGNED (retry); SUSPENDING -> PENDING
+ASSIGNABLE_STATES = {{PENDING, FAILED}}
+
+## OOM Behavior
+
+When a container exceeds its RAM limit, it is killed and operators fail. Retry failed operators with more RAM. Resource estimates can be wrong in either direction: overestimates waste capacity, underestimates cause OOM. OOM failures are recoverable through retry, so be slightly aggressive with allocation rather than overly conservative.
+
+## API Reference
+
+- Priority.QUERY, Priority.INTERACTIVE, Priority.BATCH_PIPELINE — priority levels (QUERY is highest)
+- Assignment(ops=op_list, cpu=cpu_amount, ram=ram_amount, priority=priority, pool_id=pool_id, pipeline_id=pipeline.pipeline_id) — to create assignments
+- Suspend(container_id, pool_id) — to create suspensions
+- s.executor.num_pools — number of available pools
+- s.executor.pools[i].avail_cpu_pool — available CPU in pool i
+- s.executor.pools[i].avail_ram_pool — available RAM in pool i
+- s.executor.pools[i].max_cpu_pool — max CPU in pool i
+- s.executor.pools[i].max_ram_pool — max RAM in pool i
+- Pipeline has .priority, .pipeline_id, .values (DAG of operators), and .runtime_status() method
+- ExecutionResult has .priority, .ops, .container_id, .pool_id, .ram, .cpu, .error, and .failed() method
+- pipeline.runtime_status().get_ops(states, require_parents_complete=True/False) — get operators matching states
+- pipeline.runtime_status().is_pipeline_successful() — returns True if all operators completed
+- OperatorState enum: PENDING, ASSIGNED, RUNNING, SUSPENDING, COMPLETED, FAILED (ASSIGNABLE_STATES = {{PENDING, FAILED}})
+
+Available globals (no imports needed): List, Tuple, Pipeline, OperatorState, ASSIGNABLE_STATES, Assignment, ExecutionResult, Suspend, register_scheduler_init, register_scheduler, Priority
+
+Output ONLY valid Python code. No markdown fences, no explanation.
+"""
+
 
 def get_user_request(policy_key: str, metric: str) -> str:
     """Generate user request with the provided policy key.
@@ -142,3 +188,112 @@ Failing or dropping pipelines is heavily penalized — aim for high completion r
 IMPORTANT: Use the following EXACT key in both @register_scheduler_init and @register_scheduler decorators: "{policy_key}"
 Do NOT generate your own key - you MUST use exactly: "{policy_key}"
 """.strip()
+
+def get_iteration_feedback_prompt(
+    policy_key: str,
+    scheduler_code: str,
+    scale_results: dict,
+    base_params: dict,
+) -> str:
+    """Build the user-turn feedback prompt for one iteration of LLM improvement.
+
+    Combines the weighted-latency objective function with the performance table
+    from the current scheduler run. Handles the all-failed case separately.
+    """
+    import math
+
+    rows = []
+    valid_latencies: list[float] = []
+    errors: list[str] = []
+    for scale in sorted(scale_results):
+        r = scale_results[scale]
+        cpus = base_params["cpus_per_pool"] * scale
+        ram = base_params["ram_gb_per_pool"] * scale
+        if r.get("ok"):
+            lat = r["latency"]
+            valid_latencies.append(lat)
+            rows.append(f"  {scale:2d}x  ({cpus:5d} CPUs, {ram:6d} GB RAM)  {lat:.4f}s")
+        else:
+            err = r.get("error", "unknown error")
+            errors.append(err)
+            rows.append(f"  {scale:2d}x  ({cpus:5d} CPUs, {ram:6d} GB RAM)  FAILED: {err}")
+
+    perf_table = "\n".join(rows)
+    n_valid = len(valid_latencies)
+    n_total = len(scale_results)
+
+    if valid_latencies:
+        gm = math.exp(sum(math.log(max(v, 1e-12)) for v in valid_latencies) / len(valid_latencies))
+        geomean_line = f"Geometric mean across {n_valid}/{n_total} successful runs: {gm:.4f}s"
+        return f"""\
+## Objective Function
+
+For each pipeline, assign a latency value:
+  - Completed pipeline: actual end-to-end latency in seconds
+  - Failed or incomplete pipeline: 720 seconds (= max_job_time × 2)
+
+Then compute a weighted average across all arrived pipelines:
+  score = (sum of query_latency × 10 + sum of interactive_latency × 5 + sum of batch_latency × 1)
+        / (query_arrivals × 10 + interactive_arrivals × 5 + batch_arrivals × 1)
+
+Dropping or starving pipelines is heavily penalized. High completion rate matters as much as low latency.
+
+## Performance Results (adjusted latency across cluster sizes)
+
+{perf_table}
+
+{geomean_line}
+
+## Current Scheduler Code
+
+{scheduler_code}
+
+Produce an improved version of this scheduler that reduces the geometric mean of adjusted latency across all cluster sizes. The best schedulers achieve high RAM utilization with zero or near-zero OOM failures and complete all pipeline classes.
+
+Use the EXACT key "{policy_key}" in both @register_scheduler_init and @register_scheduler decorators.
+Output ONLY the complete Python code."""
+
+    # All runs failed — lead with errors and structural requirements
+    unique_errors = list(dict.fromkeys(errors))
+    error_list = "\n".join(f"  {e}" for e in unique_errors)
+    return f"""\
+!! ALL {n_total} RUNS FAILED — STRUCTURAL ERRORS MUST BE FIXED BEFORE OPTIMIZING !!
+
+## Errors (deduplicated)
+
+{error_list}
+
+## Failed Run Details
+
+{perf_table}
+
+These are not performance problems — the scheduler could not execute at all. Fix the structural issues first.
+
+## Scheduler Interface Reference
+
+Required structure — both decorators must be present with the same key:
+
+  @register_scheduler_init(key="{policy_key}")
+  def init(s):
+      s.waiting_queue = []  # attach any state to s here
+
+  @register_scheduler(key="{policy_key}")
+  def scheduler(s, results, pipelines):
+      # results: List[ExecutionResult]  pipelines: List[Pipeline]
+      return suspensions, assignments   # List[Suspend], List[Assignment]
+
+Available globals (no imports needed): List, Tuple, Pipeline, OperatorState,
+  ASSIGNABLE_STATES, Assignment, ExecutionResult, Suspend,
+  register_scheduler_init, register_scheduler, Priority
+
+Critical API facts:
+  - Assignment requires a pipeline_id= keyword argument
+  - s.executor.pools[i].avail_cpu_pool / avail_ram_pool do NOT update within
+    a single scheduler call — track allocated resources manually
+  - Priority levels: Priority.QUERY > Priority.INTERACTIVE > Priority.BATCH_PIPELINE
+
+## Current (Broken) Scheduler
+
+{scheduler_code}
+
+Rewrite this scheduler so it runs without errors. Use the EXACT key "{policy_key}" in both @register_scheduler_init and @register_scheduler decorators. Output ONLY the complete Python code."""

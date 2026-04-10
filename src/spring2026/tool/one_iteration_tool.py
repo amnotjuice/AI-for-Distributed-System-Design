@@ -24,7 +24,6 @@ import os
 import re
 import subprocess
 import sys
-import textwrap
 import time
 from pathlib import Path
 
@@ -43,21 +42,18 @@ sys.path.insert(0, str(SPRING2026_DIR))
 
 from dotenv import load_dotenv
 from config import get_canonical_base_params, PROJECT_ROOT
+from prompts import ITERATION_SYSTEM_PROMPT, get_iteration_feedback_prompt
+
+# Fill the {context} placeholder with the Eudoxia domain knowledge markdown.
+_context = (SPRING2026_DIR / "markdown" / "eudoxia_bauplan.md").read_text()
+_SYSTEM_PROMPT = ITERATION_SYSTEM_PROMPT.format(context=_context)
+del _context
 
 os.environ.setdefault("LITELLM_LOG", "ERROR")
 logging.getLogger("eudoxia").setLevel(logging.CRITICAL)
 logging.getLogger("LiteLLM").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
-
-# ---------------------------------------------------------------------------
-# Eudoxia system prompt
-# ---------------------------------------------------------------------------
-
-EUDOXIA_SYSTEM_PROMPT = textwrap.dedent("""
-
-""").strip()
-
 
 # ---------------------------------------------------------------------------
 # Subprocess worker for isolated per-scale evaluation
@@ -137,45 +133,9 @@ def build_improvement_prompt(
     scale_results: dict[int, dict],
     base_params: dict,
 ) -> str:
-    rows = []
-    valid_latencies = []
-    for scale in sorted(scale_results):
-        r = scale_results[scale]
-        cpus = base_params["cpus_per_pool"] * scale
-        ram = base_params["ram_gb_per_pool"] * scale
-        if r.get("ok"):
-            lat = r["latency"]
-            valid_latencies.append(lat)
-            rows.append(f"  {scale:2d}x  ({cpus:5d} CPUs, {ram:6d} GB RAM)  {lat:.4f}s")
-        else:
-            rows.append(
-                f"  {scale:2d}x  ({cpus:5d} CPUs, {ram:6d} GB RAM)  FAILED: {r.get('error', '?')}"
-            )
-
-    perf_table = "\n".join(rows)
-    n_valid = len(valid_latencies)
-    n_total = len(scale_results)
-
-    if valid_latencies:
-        gm = geometric_mean(valid_latencies)
-        geomean_line = f"Geometric mean across {n_valid}/{n_total} successful runs: {gm:.4f}s"
-    else:
-        geomean_line = "No successful runs (all failed)."
-
-    return (
-        f"I have evaluated the following scheduler on a fixed workload trace across "
-        f"{n_total} cluster sizes. Cluster size is varied by scaling both CPUs and RAM "
-        f"proportionally from a base of {base_params['cpus_per_pool']} CPUs / "
-        f"{base_params['ram_gb_per_pool']} GB RAM.\n\n"
-        f"== Performance Results (adjusted latency) ==\n"
-        f"{perf_table}\n\n"
-        f"{geomean_line}\n\n"
-        f"== Current Scheduler Code ==\n"
-        f"{scheduler_code}\n\n"
-        f"Please analyze the performance results and produce an improved version of this scheduler.\n"
-        f"Your goal is to reduce the geometric mean of adjusted latency across all cluster sizes.\n"
-        f"Use the same @register_scheduler key as the original. Output ONLY the complete Python code."
-    )
+    m = re.search(r"""@register_scheduler\((?:key=)?['"]([^'"]+)['"]\)""", scheduler_code)
+    policy_key = m.group(1) if m else "unknown"
+    return get_iteration_feedback_prompt(policy_key, scheduler_code, scale_results, base_params)
 
 
 # ---------------------------------------------------------------------------
@@ -188,7 +148,7 @@ def call_llm(prompt: str, model: str, effort: str, verbose: bool) -> str:
     kwargs: dict = {
         "model": model,
         "messages": [
-            {"role": "system", "content": EUDOXIA_SYSTEM_PROMPT},
+            {"role": "system", "content": _SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ],
         "temperature": 1.0,

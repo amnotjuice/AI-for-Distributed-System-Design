@@ -564,10 +564,11 @@ def plot_05_two_shot_perf() -> None:
 def plot_06_multi_iter() -> None:
     """Fig 6: geomean latency vs iteration, one line per scenario."""
     import csv
-    csv_path = RESULTS_DIR / "06_multi_iter" / "iterations.csv"
-    if not csv_path.exists():
+    candidates = sorted((RESULTS_DIR / "06_multi_iter").glob("iterations*.csv"))
+    if not candidates:
         print("  No results yet for 06_multi_iter — run analyze.py 06_multi_iter first")
         return
+    csv_path = candidates[-1]
 
     scenarios: dict[str, list[tuple[int, float]]] = {}
     with csv_path.open() as f:

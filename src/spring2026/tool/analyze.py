@@ -490,46 +490,44 @@ def analyze_06_multi_iter(prototype: bool, dry_run: bool = False) -> None:
     _cfg = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(_cfg)  # type: ignore[union-attr]
 
+    from datetime import datetime
+
     out_dir = RESULTS_DIR / "06_multi_iter"
     out_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = out_dir / "iterations.csv"
+
+    n_scenarios = 2 if prototype else _cfg.N_SCENARIOS
+    n_iterations = 3 if prototype else _cfg.N_ITERATIONS
+
+    tag = ("_dryrun" if dry_run else "") + ("_prototype" if prototype else "")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    csv_path = out_dir / f"iterations_{timestamp}{tag}.csv"
+
+    for old in out_dir.glob("iterations*.csv"):
+        old.unlink()
 
     with (Path(__file__).resolve().parent / "scenarios.csv").open() as f:
-        scenarios = list(_csv.DictReader(f))[: _cfg.N_SCENARIOS]
-
-    done: set[tuple[str, int]] = set()
-    write_header = not csv_path.exists() or csv_path.stat().st_size == 0
-    if csv_path.exists():
-        with csv_path.open() as f:
-            for row in _csv.DictReader(f):
-                done.add((row["scenario_id"], int(row["iteration"])))
+        scenarios = list(_csv.DictReader(f))[:n_scenarios]
 
     if not dry_run:
         seed_files = sorted((SCHEDULERS_DIR / "reasoning" / "low").glob("scheduler_*.py"))
         assert seed_files, "No seed schedulers in reasoning/low. Run analyze_01_reasoning first."
 
-    with csv_path.open("a", newline="") as out_f:
+    with csv_path.open("w", newline="") as out_f:
         writer = _csv.writer(out_f)
-        if write_header:
-            writer.writerow(["scenario_id", "iteration", "geomean_latency"])
+        writer.writerow(["scenario_id", "iteration", "geomean_latency"])
 
         for s_idx, scenario in enumerate(scenarios):
             scenario_id = f"scenario_{s_idx:02d}"
-
-            if all((scenario_id, i) in done for i in range(_cfg.N_ITERATIONS)):
-                print(f"  {scenario_id}: complete, skipping")
-                continue
-
             print(f"\n--- {scenario_id}: {Path(scenario['trace']).name} ---")
             sched_dir = SCHEDULERS_DIR / "multi_iter" / scenario_id
             sched_dir.mkdir(parents=True, exist_ok=True)
 
             iter_0 = sched_dir / "iter_000.py"
-            if not iter_0.exists():
-                if dry_run:
+            if dry_run:
+                if not iter_0.exists():
                     iter_0.write_text("# dry-run seed\n")
-                else:
-                    iter_0.write_text(seed_files[0].read_text())  # type: ignore[possibly-undefined]
+            else:
+                iter_0.write_text(seed_files[0].read_text())  # type: ignore[possibly-undefined]
 
             toml_path = SPRING2026_DIR / scenario["params"]
             with toml_path.open("rb") as f:
@@ -541,10 +539,7 @@ def analyze_06_multi_iter(prototype: bool, dry_run: bool = False) -> None:
                 base_params.update(PROTOTYPE_OVERRIDES)
             trace_file = str(SPRING2026_DIR / scenario["trace"])
 
-            for it in range(_cfg.N_ITERATIONS):
-                if (scenario_id, it) in done:
-                    continue
-
+            for it in range(n_iterations):
                 iter_path = sched_dir / f"iter_{it:03d}.py"
                 next_path = sched_dir / f"iter_{it + 1:03d}.py"
 
@@ -559,21 +554,27 @@ def analyze_06_multi_iter(prototype: bool, dry_run: bool = False) -> None:
                             call_llm, extract_code, geometric_mean,
                         )
                         assert iter_path.exists(), f"Missing {iter_path}"
+                        print(f"  [debug] scheduler : {iter_path} (exists={iter_path.exists()})")
+                        print(f"  [debug] trace     : {trace_file} (exists={Path(trace_file).exists()})")
                         scale_results = evaluate_across_scales(iter_path, trace_file, [1, 2, 4, 8, 16], base_params)
                         valid = [r["latency"] for r in scale_results.values() if r.get("ok")]
                         gm = geometric_mean(valid) if valid else float("nan")
                         prompt = build_improvement_prompt(iter_path.read_text(), scale_results, base_params)
                         improved = extract_code(call_llm(prompt, _cfg.MODEL, _cfg.REASONING_EFFORT, False))
+                        if not re.search(r"""@register_scheduler\((?:key=)?['"]([^'"]+)['"]\)""", improved):
+                            raise ValueError("LLM output missing @register_scheduler key")
                         next_path.write_text(improved + "\n")
                 except Exception as exc:
-                    print(f"  [{scenario_id}] iter {it + 1:>2}/{_cfg.N_ITERATIONS}: ERROR — {exc}")
+                    import traceback
+                    print(f"  [{scenario_id}] iter {it + 1:>2}/{n_iterations}: ERROR — {exc}")
+                    print(traceback.format_exc())
                     gm = float("nan")
                     if not next_path.exists():
                         next_path.write_text(iter_path.read_text())
 
                 writer.writerow([scenario_id, it, round(gm, 4)])
                 out_f.flush()
-                print(f"  [{scenario_id}] iter {it + 1:>2}/{_cfg.N_ITERATIONS}: geomean={gm:.4f}s")
+                print(f"  [{scenario_id}] iter {it + 1:>2}/{n_iterations}: geomean={gm:.4f}s")
 
     print(f"\nOutput: {csv_path}")
 
