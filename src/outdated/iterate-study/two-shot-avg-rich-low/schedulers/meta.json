@@ -1,0 +1,42 @@
+{
+  "source_effort": "low",
+  "source_scheduler": "scheduler_low_011.py",
+  "source_median_latency": 134.53617494046102,
+  "source_results": {
+    "filename": "scheduler_low_011.py",
+    "baseline_median": 12999.69611111111,
+    "metric": "latency",
+    "policy_key": "scheduler_low_011",
+    "reasoning_effort": "low",
+    "model": "gpt-5.2-2025-12-11",
+    "llm_cost": 0.054487,
+    "generation_seconds": 42.64,
+    "generated_at": "2026-03-12T21:42:43.184661",
+    "code_lines": 176,
+    "uses_priority": true,
+    "uses_suspension": false,
+    "uses_multi_pool": true,
+    "functional": true,
+    "failure_mode": "success",
+    "median_latency": 134.53617494046102,
+    "metric_values": [
+      367.10684346898336,
+      381.3534828807556,
+      93.62092810457516,
+      77.38569636678201,
+      111.6758849042632,
+      93.82307382212146,
+      131.7416800584368,
+      137.33066982248522,
+      222.94832955404385,
+      205.54067275562488
+    ],
+    "beats_baseline": true,
+    "improvement_pct": -98.96508215430153,
+    "simulation_seconds": 36.77
+  },
+  "model": "gpt-5.2-2025-12-11",
+  "metric": "latency",
+  "feedback_mode": "rich",
+  "n": 20
+}

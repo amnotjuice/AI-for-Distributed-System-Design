@@ -379,3 +379,23 @@ def priority_pool_scheduler(s, results, pipelines):
 
     return [], new_assignments  # No suspensions for this scheduler
 ```
+
+## Using the memory estimator
+
+When an estimator is available, each operator has `op.estimate.mem_peak_gb` — the estimated peak RAM (in GB) needed to run without OOM. Use it to set a RAM floor that prevents OOM, while still allocating generous CPU for fast execution:
+
+```python
+# Reading the estimate (returns float or None if unavailable)
+est = getattr(op.estimate, "mem_peak_gb", None)
+
+# Use it as a RAM floor: ensure at least the estimated peak, but give more if available
+if est is not None:
+    ram = max(est, avail_ram)  # prevent OOM, but use all available RAM if possible
+else:
+    ram = avail_ram  # no estimate — fall back to greedy allocation
+```
+
+Key points:
+- `op.estimate.mem_peak_gb` may be `None` if no estimator is configured. Always check.
+- The estimate is a **floor**, not a ceiling — allocating more RAM than the estimate is fine and won't hurt performance.
+- CPU allocation still drives execution speed. Allocate CPU generously; only RAM needs the estimate-based floor.

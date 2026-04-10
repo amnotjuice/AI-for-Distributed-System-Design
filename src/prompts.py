@@ -54,3 +54,91 @@ as you generate a new policy.
 IMPORTANT: Use the following EXACT key in both @register_scheduler_init and @register_scheduler decorators: "{policy_key}"
 Do NOT generate your own key - you MUST use exactly: "{policy_key}"
 """.strip()
+
+
+def get_user_request_v2_est(policy_key: str) -> str:
+    """get_user_request_v2 with estimator context added.
+
+    Args:
+        policy_key: The policy key that the LLM should use in @register_scheduler decorators
+    Returns:
+        The formatted user request string
+    """
+    return f"""
+Design a scheduling policy that minimizes the following objective (lower is better):
+
+## Objective Function
+
+For each pipeline, assign a latency value:
+  - Completed pipeline: actual end-to-end latency in seconds
+  - Failed or incomplete pipeline: 720 seconds (= max_job_time × 2)
+
+Then compute a weighted average across all arrived pipelines:
+  score = (sum of query_latency × 10  +  sum of interactive_latency × 5  +  sum of batch_latency × 1)
+          / (query_arrivals × 10  +  interactive_arrivals × 5  +  batch_arrivals × 1)
+
+Priority weights: query=10x, interactive=5x, batch=1x.
+Failing or dropping pipelines is heavily penalized — aim for high completion rate alongside low latency.
+
+## Estimator
+
+Each operator has an `op.estimate.mem_peak_gb` field (float or None).
+This is a pre-computed estimate of the operator's peak memory usage in GB.
+It may be None if the estimator has not yet run for that operator — always check before using.
+
+You can use this estimate to make smarter memory-aware scheduling decisions, for example:
+  - Skip assigning an operator if `op.estimate.mem_peak_gb` exceeds available RAM in all pools
+  - Prefer pools where the estimated memory fits without causing OOM
+  - Prioritize operators with smaller memory footprint when resources are tight
+
+Note: the estimate is noisy — treat it as a hint, not a guarantee.
+
+## Guidelines
+
+- Start with small improvements over the naive FIFO baseline.
+- Protect query and interactive latency; they dominate the score.
+- Avoid designs that drop or starve pipelines — each failure adds 720s to the weighted sum.
+- Use `op.estimate.mem_peak_gb` to reduce OOM failures and improve memory utilization.
+- Make the policy complex gradually, only after you have working code.
+- Make sure to consider the results of previous attempts and the feedback provided.
+
+IMPORTANT: Use the following EXACT key in both @register_scheduler_init and @register_scheduler decorators: "{policy_key}"
+Do NOT generate your own key - you MUST use exactly: "{policy_key}"
+""".strip()
+
+
+def get_user_request_v2(policy_key: str) -> str:
+    """Generate user request with explicit weighted-latency objective.
+
+    Args:
+        policy_key: The policy key that the LLM should use in @register_scheduler decorators
+    Returns:
+        The formatted user request string
+    """
+    return f"""
+Design a scheduling policy that minimizes the following objective (lower is better):
+
+## Objective Function
+
+For each pipeline, assign a latency value:
+  - Completed pipeline: actual end-to-end latency in seconds
+  - Failed or incomplete pipeline: 720 seconds (= max_job_time × 2)
+
+Then compute a weighted average across all arrived pipelines:
+  score = (sum of query_latency × 10  +  sum of interactive_latency × 5  +  sum of batch_latency × 1)
+          / (query_arrivals × 10  +  interactive_arrivals × 5  +  batch_arrivals × 1)
+
+Priority weights: query=10x, interactive=5x, batch=1x.
+Failing or dropping pipelines is heavily penalized — aim for high completion rate alongside low latency.
+
+## Guidelines
+
+- Start with small improvements over the naive FIFO baseline.
+- Protect query and interactive latency; they dominate the score.
+- Avoid designs that drop or starve pipelines — each failure adds 720s to the weighted sum.
+- Make the policy complex gradually, only after you have working code.
+- Make sure to consider the results of previous attempts and the feedback provided.
+
+IMPORTANT: Use the following EXACT key in both @register_scheduler_init and @register_scheduler decorators: "{policy_key}"
+Do NOT generate your own key - you MUST use exactly: "{policy_key}"
+""".strip()

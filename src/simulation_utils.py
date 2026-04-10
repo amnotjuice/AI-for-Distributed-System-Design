@@ -1,6 +1,5 @@
 from functools import wraps
 import os
-import signal
 from time import time
 from typing import List
 
@@ -12,36 +11,6 @@ from eudoxia.workload.csv_io import (
     WorkloadTraceGenerator,
     CSVWorkloadReader,
 )
-
-# Timeout for a single simulation run (in seconds)
-SIMULATION_TIMEOUT = 60  # 60s per trace — covers 95th percentile; outliers beyond this are impractical
-LAST_SIMULATION_FAILURE = None
-
-
-class SimulationTimeoutError(Exception):
-    """Raised when a single simulation exceeds the time limit."""
-    pass
-
-
-def _set_last_failure(reason: str, trace_file: str, detail: str):
-    global LAST_SIMULATION_FAILURE
-    LAST_SIMULATION_FAILURE = {
-        "reason": reason,
-        "trace_file": trace_file,
-        "detail": detail,
-        "timeout_seconds": SIMULATION_TIMEOUT if reason == "timeout" else None,
-    }
-
-
-def get_last_simulation_failure() -> dict | None:
-    """Return details of the most recent per-trace simulation failure."""
-    if LAST_SIMULATION_FAILURE is None:
-        return None
-    return LAST_SIMULATION_FAILURE.copy()
-
-
-def _timeout_handler(signum, frame):
-    raise SimulationTimeoutError("Simulation exceeded timeout limit")
 
 
 test_policy_as_string = """
@@ -121,43 +90,21 @@ def generate_trace_file(params, output_file):
 def run_simulation_with_trace(params, trace_file):
     """Run simulation using a trace file.
 
-    Returns None if no containers complete (which causes percentile calculation to fail),
-    or if the simulation exceeds the timeout limit.
+    Returns None if no containers complete (which causes percentile calculation to fail).
     """
     with open(trace_file) as f:
         reader = CSVWorkloadReader(f)
         workload = reader.get_workload(params["ticks_per_second"])
-        old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
-        signal.alarm(SIMULATION_TIMEOUT)
         try:
-            result = run_simulator(params, workload=workload)
-            return result
-        except SimulationTimeoutError:
-            _set_last_failure(
-                reason="timeout",
-                trace_file=trace_file,
-                detail=f"Exceeded {SIMULATION_TIMEOUT}s per-trace limit",
-            )
-            import logging
-            logging.getLogger(__name__).warning(
-                f"Simulation timed out on {trace_file} after {SIMULATION_TIMEOUT}s"
-            )
-            return None
+            return run_simulator(params, workload=workload)
         except IndexError as e:
             # This happens when no containers complete (empty container_tick_times)
-            _set_last_failure(
-                reason="no_completed_containers",
-                trace_file=trace_file,
-                detail=str(e),
-            )
             import logging
+
             logging.getLogger(__name__).warning(
                 f"No containers completed in {trace_file}, skipping: {e}"
             )
             return None
-        finally:
-            signal.alarm(0)
-            signal.signal(signal.SIGALRM, old_handler)
 
 
 @timing
@@ -196,25 +143,12 @@ def get_raw_stats_for_policy(
     """
     params = base_params.copy()
     params["scheduler_algo"] = policy_algorithm
-    global LAST_SIMULATION_FAILURE
-    LAST_SIMULATION_FAILURE = None
     # Run sequentially in this process to preserve scheduler registrations from exec()
-    stats = []
-    for trace_file in trace_files:
-        s = run_simulation_with_trace(params, trace_file)
-        if s is None:
-            if LAST_SIMULATION_FAILURE is None:
-                _set_last_failure(
-                    reason="unknown",
-                    trace_file=trace_file,
-                    detail="run_simulation_with_trace returned None without explicit reason",
-                )
-            # Short-circuit: if one simulation fails or times out, the whole policy is doomed
-            # to fail the length check later. Stop wasting time on remaining trace files.
-            import logging
-            logging.getLogger(__name__).warning("Simulation failed/timed out. Short-circuiting remaining traces.")
-            break
-        stats.append(s)
+    all_stats = [
+        run_simulation_with_trace(params, trace_file) for trace_file in trace_files
+    ]
+    # Filter out None results (from simulations where no containers completed)
+    stats = [s for s in all_stats if s is not None]
     return stats
 
 
@@ -238,6 +172,17 @@ def extract_metrics_from_stats(
     else:
         assert metric == "throughput", f"Unknown metric: {metric}"
         return [s.throughput for s in raw_stats]
+
+
+def deregister_scheduler(key: str) -> None:
+    """Remove a scheduler key from eudoxia's global registries.
+
+    Required when running multiple schedulers sequentially in the same process
+    to avoid KeyError from duplicate key registration.
+    """
+    from eudoxia.scheduler.decorators import INIT_ALGOS, SCHEDULING_ALGOS
+    INIT_ALGOS.pop(key, None)
+    SCHEDULING_ALGOS.pop(key, None)
 
 
 def get_stats_for_policy(

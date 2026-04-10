@@ -31,7 +31,7 @@
 
 * Workload generator: creates pipelines (DAGs) with per-operator RAM minima and CPU scaling; supports random or trace-driven arrivals and priority mixes.
 * Scheduler interface: plug-in policies via simple init/step callbacks. The policy decides admission, placement (pool/VM), CPU/RAM sizing, and preemptions.
-* Executor model: one or more VM pools with finite vCPU and RAM. Execution time depends on allocated CPU and operator's scaling curve; allocations below RAM minima fail fast as OOM.
+* Executor model: one or more VM pools with finite vCPU and RAM. More CPU → faster execution (sublinear scaling). More RAM beyond the minimum has no performance cost — only allocating below the operator's true peak causes an OOM failure.
 * Clock & determinism: a fast, discrete event loop advances the system, collecting comparable metrics for each policy.
 
 ## Policies You Can Evaluate (examples)

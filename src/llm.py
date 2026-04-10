@@ -15,6 +15,17 @@ _response_costs = []
 _last_request_cost = None  # Track cost of most recent request
 
 
+def _resolve_model_for_litellm(model: str) -> str:
+    """Map bare model names to provider-qualified LiteLLM names."""
+    if "/" in model:
+        return model
+    if model.startswith("gpt-") or model.startswith("o"):
+        return f"openai/{model}"
+    if model.startswith("claude"):
+        return f"anthropic/{model}"
+    return model
+
+
 def build_system_context(files=[], sections={}):
     """Build the system context from markdown files and additional sections.
 
@@ -68,8 +79,9 @@ def completion_with_retry(
 
     for attempt in range(max_retries):
         try:
+            resolved_model = _resolve_model_for_litellm(model)
             response = completion(
-                model=model,
+                model=resolved_model,
                 messages=messages,
                 temperature=temperature,
                 reasoning_effort=reasoning_effort,
@@ -187,6 +199,7 @@ def generate_policy(
     policy_key,
     verbose=False,
     reasoning_effort_override=None,
+    context_files=None,
 ):
     """Generate a policy using LLM.
 
@@ -225,7 +238,7 @@ def generate_policy(
     ]
     starter_template = starter_template.format(scheduler_name="example")
     system_context = build_system_context(
-        files=["eudoxia_bauplan.md"],
+        files=context_files or ["eudoxia_bauplan.md"],
         sections={"Starter Scheduler Template": f"```python\n{starter_template}\n```"},
     )
 

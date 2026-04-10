@@ -49,7 +49,7 @@ from llm import (  # noqa: E402
 # load env variables
 load_dotenv()
 # Ensure API keys to call the models are set
-assert os.environ.get("ANTHROPIC_API_KEY"), "ANTHROPIC_API_KEY not set in env"
+# assert os.environ.get("ANTHROPIC_API_KEY"), "ANTHROPIC_API_KEY not set in env"
 assert os.environ.get("OPENAI_API_KEY"), "OPENAI_API_KEY not set in env"
 
 
