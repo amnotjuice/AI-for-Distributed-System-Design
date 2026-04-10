@@ -36,8 +36,11 @@ logging.getLogger("eudoxia").setLevel(logging.CRITICAL)
 from spring2026.tool.config import (
     ESTIMATOR_CONDITIONS,
     EXPERIMENTS,
+    EXPERIMENTS_DIR,
+    PROTOTYPE_OVERRIDES,
     RESULTS_DIR,
     SCHEDULERS_DIR,
+    SPRING2026_DIR,
     TRACES_DIR,
     get_canonical_base_params,
     wilson_interval,
@@ -473,9 +476,106 @@ def analyze_05_two_shot_perf(prototype: bool) -> None:
     print("analyze_05: not yet implemented")
 
 
-def analyze_06_multi_iter(prototype: bool) -> None:
+def analyze_06_multi_iter(prototype: bool, dry_run: bool = False) -> None:
     """Fig 6: 10 scenarios × 50 iterations, latency vs iteration."""
-    print("analyze_06: not yet implemented")
+    import csv as _csv
+    import importlib.util
+    import random
+    import tomllib
+
+    _spec = importlib.util.spec_from_file_location(
+        "exp06_config", EXPERIMENTS_DIR / "06_multi_iter" / "config.py"
+    )
+    assert _spec is not None and _spec.loader is not None
+    _cfg = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_cfg)  # type: ignore[union-attr]
+
+    out_dir = RESULTS_DIR / "06_multi_iter"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = out_dir / "iterations.csv"
+
+    with (Path(__file__).resolve().parent / "scenarios.csv").open() as f:
+        scenarios = list(_csv.DictReader(f))[: _cfg.N_SCENARIOS]
+
+    done: set[tuple[str, int]] = set()
+    write_header = not csv_path.exists() or csv_path.stat().st_size == 0
+    if csv_path.exists():
+        with csv_path.open() as f:
+            for row in _csv.DictReader(f):
+                done.add((row["scenario_id"], int(row["iteration"])))
+
+    if not dry_run:
+        seed_files = sorted((SCHEDULERS_DIR / "reasoning" / "low").glob("scheduler_*.py"))
+        assert seed_files, "No seed schedulers in reasoning/low. Run analyze_01_reasoning first."
+
+    with csv_path.open("a", newline="") as out_f:
+        writer = _csv.writer(out_f)
+        if write_header:
+            writer.writerow(["scenario_id", "iteration", "geomean_latency"])
+
+        for s_idx, scenario in enumerate(scenarios):
+            scenario_id = f"scenario_{s_idx:02d}"
+
+            if all((scenario_id, i) in done for i in range(_cfg.N_ITERATIONS)):
+                print(f"  {scenario_id}: complete, skipping")
+                continue
+
+            print(f"\n--- {scenario_id}: {Path(scenario['trace']).name} ---")
+            sched_dir = SCHEDULERS_DIR / "multi_iter" / scenario_id
+            sched_dir.mkdir(parents=True, exist_ok=True)
+
+            iter_0 = sched_dir / "iter_000.py"
+            if not iter_0.exists():
+                if dry_run:
+                    iter_0.write_text("# dry-run seed\n")
+                else:
+                    iter_0.write_text(seed_files[0].read_text())  # type: ignore[possibly-undefined]
+
+            toml_path = SPRING2026_DIR / scenario["params"]
+            with toml_path.open("rb") as f:
+                base_params = tomllib.load(f)
+            base_params.setdefault("per_trace_timeout", None)
+            base_params.setdefault("subprocess_timeout", None)
+            base_params.setdefault("estimator_algo", None)
+            if prototype:
+                base_params.update(PROTOTYPE_OVERRIDES)
+            trace_file = str(SPRING2026_DIR / scenario["trace"])
+
+            for it in range(_cfg.N_ITERATIONS):
+                if (scenario_id, it) in done:
+                    continue
+
+                iter_path = sched_dir / f"iter_{it:03d}.py"
+                next_path = sched_dir / f"iter_{it + 1:03d}.py"
+
+                try:
+                    if dry_run:
+                        random.seed(s_idx * 1000 + it)
+                        gm = max(50.0, 500.0 * (0.97 ** it) + random.uniform(-10, 10))
+                        next_path.write_text(f"# dry-run iter {it + 1}\n")
+                    else:
+                        from one_iteration_tool import (
+                            evaluate_across_scales, build_improvement_prompt,
+                            call_llm, extract_code, geometric_mean,
+                        )
+                        assert iter_path.exists(), f"Missing {iter_path}"
+                        scale_results = evaluate_across_scales(iter_path, trace_file, [1, 2, 4, 8, 16], base_params)
+                        valid = [r["latency"] for r in scale_results.values() if r.get("ok")]
+                        gm = geometric_mean(valid) if valid else float("nan")
+                        prompt = build_improvement_prompt(iter_path.read_text(), scale_results, base_params)
+                        improved = extract_code(call_llm(prompt, _cfg.MODEL, _cfg.REASONING_EFFORT, False))
+                        next_path.write_text(improved + "\n")
+                except Exception as exc:
+                    print(f"  [{scenario_id}] iter {it + 1:>2}/{_cfg.N_ITERATIONS}: ERROR — {exc}")
+                    gm = float("nan")
+                    if not next_path.exists():
+                        next_path.write_text(iter_path.read_text())
+
+                writer.writerow([scenario_id, it, round(gm, 4)])
+                out_f.flush()
+                print(f"  [{scenario_id}] iter {it + 1:>2}/{_cfg.N_ITERATIONS}: geomean={gm:.4f}s")
+
+    print(f"\nOutput: {csv_path}")
 
 
 def analyze_07_cross_eval(prototype: bool) -> None:
@@ -522,6 +622,10 @@ def main() -> None:
         "--workers", type=int, default=8,
         help="Number of parallel workers for probe evaluation (default: 8).",
     )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Skip LLM/simulator calls; use fake data. Only applies to experiments that support it.",
+    )
     args = parser.parse_args()
 
     exps = list(HANDLERS) if args.experiment == "all" else [args.experiment]
@@ -532,9 +636,12 @@ def main() -> None:
             print("  [PROTOTYPE MODE — results not meaningful]")
         print("=" * 60)
         handler = HANDLERS[exp]
+        sig = inspect.signature(handler).parameters
         kwargs: dict = {"prototype": args.prototype}
-        if "workers" in inspect.signature(handler).parameters:
+        if "workers" in sig:
             kwargs["workers"] = args.workers
+        if "dry_run" in sig:
+            kwargs["dry_run"] = args.dry_run
         handler(**kwargs)
 
 

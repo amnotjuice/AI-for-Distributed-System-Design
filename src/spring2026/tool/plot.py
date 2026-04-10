@@ -562,13 +562,38 @@ def plot_05_two_shot_perf() -> None:
 
 
 def plot_06_multi_iter() -> None:
-    """Fig 6: latency vs iteration for 10 scenarios."""
-    grouped = load_results("06_multi_iter")
-    if not grouped:
-        print("  No results yet for 06_multi_iter")
+    """Fig 6: geomean latency vs iteration, one line per scenario."""
+    import csv
+    csv_path = RESULTS_DIR / "06_multi_iter" / "iterations.csv"
+    if not csv_path.exists():
+        print("  No results yet for 06_multi_iter — run analyze.py 06_multi_iter first")
         return
-    # TODO: needs iteration-indexed data structure
-    print("plot_06: stub — data format TBD")
+
+    scenarios: dict[str, list[tuple[int, float]]] = {}
+    with csv_path.open() as f:
+        for row in csv.DictReader(f):
+            scenarios.setdefault(row["scenario_id"], []).append(
+                (int(row["iteration"]), float(row["geomean_latency"]))
+            )
+
+    if not scenarios:
+        print("  iterations.csv is empty")
+        return
+
+    fig, ax = plt.subplots(figsize=(3.5, 2.4))
+    colors = plt.get_cmap("tab10")
+    for i, sid in enumerate(sorted(scenarios)):
+        points = sorted(scenarios[sid])
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
+        ax.plot(xs, ys, color=colors(i), linewidth=0.9, label=sid)
+
+    ax.set_xlabel("Iteration", fontsize=7)
+    ax.set_ylabel("Geomean Latency (s)", fontsize=7)
+    ax.tick_params(axis="both", labelsize=6)
+    ax.legend(frameon=False, fontsize=5, ncol=2, loc="upper right")
+    _style_axes(ax)
+    _save(fig, PLOTS_DIR / "06_multi_iter" / "fig6")
 
 
 def plot_07_cross_eval() -> None:
