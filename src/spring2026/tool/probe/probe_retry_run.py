@@ -54,13 +54,12 @@ def probe_retry_run(
     simulation_params["ram_gb_per_pool"] = 64
     
     try:
-        raw = get_raw_stats_for_policy(simulation_params, trace_files[:3], key_match.group(1))    
+        raw = get_raw_stats_for_policy(simulation_params, trace_files, key_match.group(1))
 
-        if len(raw) != 3:
-
+        if len(raw) != len(trace_files):
             return {
                 "functional": False, "failure_mode": "simulation_error",
-                "error_message": f"Got {len(raw)}/3 results",
+                "error_message": f"Got {len(raw)}/{len(trace_files)} results",
             }
 
         for stats in raw:

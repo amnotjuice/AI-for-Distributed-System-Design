@@ -36,7 +36,7 @@ TOOLS_DIR = Path(__file__).resolve().parent
 ONE_SHOT_DIR = TOOLS_DIR.parent
 SPRING2026_DIR = ONE_SHOT_DIR.parent
 WORKER_SCRIPT = TOOLS_DIR / "_one_iteration_worker.py"
-MOCK_DATA_DIR = SPRING2026_DIR / "mock-data"
+MOCK_DATA_DIR = ONE_SHOT_DIR / "mock-data"
 
 sys.path.insert(0, str(ONE_SHOT_DIR))
 sys.path.insert(0, str(SPRING2026_DIR))

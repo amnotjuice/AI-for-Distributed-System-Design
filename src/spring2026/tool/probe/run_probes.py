@@ -156,6 +156,30 @@ def _worker(args: tuple) -> tuple[Path, dict[str, dict]]:
     return scheduler_file, results
 
 
+def run_probes_parallel(
+    scheduler_files: list[Path],
+    base_params: dict,
+    traces: dict[str, str],
+    workers: int = 1,
+) -> list[dict[str, dict]]:
+    """Run all probes over scheduler_files, returning results in input order.
+
+    workers=1 runs sequentially. workers>1 uses ProcessPoolExecutor.
+    No printing — callers handle their own output.
+    """
+    if workers <= 1:
+        return [run_all_probes(sf, base_params, traces) for sf in scheduler_files]
+
+    results_by_file: dict[Path, dict[str, dict]] = {}
+    worker_args = [(sf, base_params, traces) for sf in scheduler_files]
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(_worker, wa): wa[0] for wa in worker_args}
+        for future in as_completed(futures):
+            sf, results = future.result()
+            results_by_file[sf] = results
+    return [results_by_file[sf] for sf in scheduler_files]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("targets", nargs="+", type=Path,

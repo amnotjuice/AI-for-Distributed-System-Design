@@ -6,6 +6,7 @@ import math
 from pathlib import Path
 
 SPRING2026_DIR = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = SPRING2026_DIR.parent.parent
 TRACES_DIR = SPRING2026_DIR / "traces"
 SCHEDULERS_DIR = SPRING2026_DIR / "schedulers"
 RESULTS_DIR = SPRING2026_DIR / "results"

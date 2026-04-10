@@ -331,26 +331,24 @@ def run_analyze(
 # Per-experiment handlers
 # ---------------------------------------------------------------------------
 
-def _run_probes_for_dir(sched_dir: Path, out_dir: Path, base_params: dict) -> None:
+def _run_probes_for_dir(sched_dir: Path, out_dir: Path, base_params: dict, workers: int = 1) -> None:
     """Run all probes on schedulers in sched_dir, write CSV to out_dir/probes.csv."""
     _probe_dir = Path(__file__).resolve().parent / "probe"
     sys.path.insert(0, str(_probe_dir))
-    from run_probes import ensure_traces, run_all_probes, write_csv
+    from run_probes import ensure_traces, run_probes_parallel, write_csv
 
     traces = ensure_traces()
     scheduler_files = sorted(sched_dir.glob("scheduler_*.py"))
     if not scheduler_files:
         return
-    all_results = []
-    for sf in scheduler_files:
-        results = run_all_probes(sf, base_params, traces)
-        all_results.append(results)
+    all_results = run_probes_parallel(scheduler_files, base_params, traces, workers=workers)
+    for sf, results in zip(scheduler_files, all_results):
         passed = sum(1 for r in results.values() if r.get("functional"))
         print(f"  {sf.name}: {passed}/{len(results)}")
     write_csv(scheduler_files, all_results, out_dir / "probes.csv")
 
 
-def analyze_01_reasoning(prototype: bool) -> None:
+def analyze_01_reasoning(prototype: bool, workers: int = 1) -> None:
     """Fig 1: one-shot, vary reasoning level, no estimation."""
     base_params = get_canonical_base_params(prototype=prototype)
     canonical = TRACES_DIR / "bench_canonical_train.csv"
@@ -366,13 +364,13 @@ def analyze_01_reasoning(prototype: bool) -> None:
         out_dir = RESULTS_DIR / "01_reasoning" / effort
 
         print(f"\n--- Probes: {effort} ---")
-        _run_probes_for_dir(sched_dir, out_dir, base_params)
+        _run_probes_for_dir(sched_dir, out_dir, base_params, workers=workers)
 
         print(f"\n--- Latency: {effort} ---")
         run_analyze([sched_dir], trace_files, out_dir, base_params, exp_label=f"reasoning={effort}")
 
 
-def analyze_02_estimation(prototype: bool) -> None:
+def analyze_02_estimation(prototype: bool, workers: int = 1) -> None:
     """Fig 2: one-shot, vary estimation noise, medium reasoning."""
     sched_dir = SCHEDULERS_DIR / "estimation"
     if not sched_dir.exists() or not list(sched_dir.glob("scheduler_*.py")):
@@ -388,7 +386,7 @@ def analyze_02_estimation(prototype: bool) -> None:
     # Run probes once for the estimation schedulers
     out_base = RESULTS_DIR / "02_estimation"
     print("\n--- Probes: estimation ---")
-    _run_probes_for_dir(sched_dir, out_base, base_params)
+    _run_probes_for_dir(sched_dir, out_base, base_params, workers=workers)
 
     # Evaluate under each sigma condition
     for sigma_str, sigma_params in ESTIMATOR_CONDITIONS.items():
@@ -399,7 +397,7 @@ def analyze_02_estimation(prototype: bool) -> None:
         run_analyze([sched_dir], trace_files, out_dir, params, exp_label=f"estimation={sigma_str}")
 
 
-def analyze_03_two_iter_best_worst(prototype: bool) -> None:
+def analyze_03_two_iter_best_worst(prototype: bool, workers: int = 1) -> None:
     """Fig 3: two-iteration, best/worst/median schedulers, rich vs simple context."""
     base_params = get_canonical_base_params(prototype=prototype)
     canonical = TRACES_DIR / "bench_canonical_train.csv"
@@ -509,6 +507,7 @@ HANDLERS = {
 
 
 def main() -> None:
+    import inspect
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
         "experiment",
@@ -519,6 +518,10 @@ def main() -> None:
         "--prototype", action="store_true",
         help="Fast/cheap run (1-min sims, validates infra only)",
     )
+    parser.add_argument(
+        "--workers", type=int, default=8,
+        help="Number of parallel workers for probe evaluation (default: 8).",
+    )
     args = parser.parse_args()
 
     exps = list(HANDLERS) if args.experiment == "all" else [args.experiment]
@@ -528,7 +531,11 @@ def main() -> None:
         if args.prototype:
             print("  [PROTOTYPE MODE — results not meaningful]")
         print("=" * 60)
-        HANDLERS[exp](prototype=args.prototype)
+        handler = HANDLERS[exp]
+        kwargs: dict = {"prototype": args.prototype}
+        if "workers" in inspect.signature(handler).parameters:
+            kwargs["workers"] = args.workers
+        handler(**kwargs)
 
 
 if __name__ == "__main__":
