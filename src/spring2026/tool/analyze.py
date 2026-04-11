@@ -518,7 +518,8 @@ def analyze_06_multi_iter(prototype: bool, dry_run: bool = False) -> None:
 
         for s_idx, scenario in enumerate(scenarios):
             scenario_id = f"scenario_{s_idx:02d}"
-            print(f"\n--- {scenario_id}: {Path(scenario['trace']).name} ---")
+            objective = scenario.get("objective", "")
+            print(f"\n--- {scenario_id}: {Path(scenario['train_trace']).name} ---")
             sched_dir = SCHEDULERS_DIR / "multi_iter" / scenario_id
             sched_dir.mkdir(parents=True, exist_ok=True)
 
@@ -537,7 +538,7 @@ def analyze_06_multi_iter(prototype: bool, dry_run: bool = False) -> None:
             base_params.setdefault("estimator_algo", None)
             if prototype:
                 base_params.update(PROTOTYPE_OVERRIDES)
-            trace_file = str(SPRING2026_DIR / scenario["trace"])
+            trace_file = str(SPRING2026_DIR / scenario["train_trace"])
 
             for it in range(n_iterations):
                 iter_path = sched_dir / f"iter_{it:03d}.py"
@@ -579,9 +580,94 @@ def analyze_06_multi_iter(prototype: bool, dry_run: bool = False) -> None:
     print(f"\nOutput: {csv_path}")
 
 
-def analyze_07_cross_eval(prototype: bool) -> None:
-    """Fig 7: cross-eval heatmap."""
-    print("analyze_07: not yet implemented")
+def _cross_eval_worker(args: tuple) -> tuple[str, str, dict]:
+    """Module-level worker for ProcessPoolExecutor: run one (scheduler, workload) cell."""
+    scheduler_id, workload_id, sched_str, trace_file, params = args
+    worker_script = Path(__file__).resolve().parent / "_one_iteration_worker.py"
+    project_root = Path(__file__).resolve().parent.parent.parent.parent
+    cmd = [sys.executable, str(worker_script), sched_str, trace_file, json.dumps(params)]
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True,
+            cwd=str(project_root),
+            timeout=params.get("subprocess_timeout", 120),
+        )
+        for line in reversed(proc.stdout.strip().split("\n")):
+            if line.startswith("__RESULT__"):
+                return scheduler_id, workload_id, json.loads(line[len("__RESULT__"):])
+        stderr_snip = proc.stderr[-300:] if proc.stderr else "no stderr"
+        return scheduler_id, workload_id, {"ok": False, "error": f"no result marker: {stderr_snip!r}"}
+    except subprocess.TimeoutExpired:
+        return scheduler_id, workload_id, {"ok": False, "error": "subprocess timeout"}
+    except Exception as exc:
+        return scheduler_id, workload_id, {"ok": False, "error": str(exc)}
+
+
+def analyze_07_cross_eval(prototype: bool, workers: int = 16) -> None:
+    """Fig 7: cross-eval heatmap — scheduler X evaluated on workload Y."""
+    import csv as _csv
+    import tomllib
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    from datetime import datetime
+
+    sched_dir = SCHEDULERS_DIR / "reasoning" / "high"
+    sched_files = sorted(sched_dir.glob("scheduler_*.py"))
+    assert sched_files, f"No schedulers in {sched_dir}"
+
+    with (Path(__file__).resolve().parent / "scenarios.csv").open() as f:
+        scenarios = list(_csv.DictReader(f))
+
+    if prototype:
+        sched_files = sched_files[:12]
+        scenarios = scenarios[:12]
+
+    out_dir = RESULTS_DIR / "07_cross_eval"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for old in out_dir.glob("cross_eval*.csv"):
+        old.unlink()
+
+    tag = "_prototype" if prototype else ""
+    csv_path = out_dir / f"cross_eval_{datetime.now().strftime('%Y%m%d_%H%M%S')}{tag}.csv"
+
+    # Build all (scheduler, workload) tasks upfront
+    tasks = []
+    for w_idx, scenario in enumerate(scenarios):
+        workload_id = f"scenario_{w_idx:02d}"
+        toml_path = SPRING2026_DIR / scenario["params"]
+        with toml_path.open("rb") as f:
+            params = tomllib.load(f)
+        params.setdefault("per_trace_timeout", None)
+        params.setdefault("subprocess_timeout", None)
+        params.setdefault("estimator_algo", None)
+        if prototype:
+            params.update(PROTOTYPE_OVERRIDES)
+        trace_file = str(SPRING2026_DIR / scenario["trace"])
+        for sched_path in sched_files:
+            tasks.append((sched_path.stem, workload_id, str(sched_path), trace_file, params))
+
+    total = len(tasks)
+    print(f"Schedulers: {len(sched_files)}  Workloads: {len(scenarios)}  Total cells: {total}  Workers: {workers}")
+
+    with csv_path.open("w", newline="") as out_f:
+        writer = _csv.writer(out_f)
+        writer.writerow(["scheduler_id", "workload_id", "latency"])
+
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(_cross_eval_worker, t): t for t in tasks}
+            done = 0
+            for future in as_completed(futures):
+                scheduler_id, workload_id, result = future.result()
+                done += 1
+                if result.get("ok"):
+                    latency = result["latency"]
+                    print(f"  [{done}/{total}] {scheduler_id} × {workload_id}: {latency:.4f}s")
+                else:
+                    latency = "nan"
+                    print(f"  [{done}/{total}] {scheduler_id} × {workload_id}: FAILED: {result.get('error', '?')}")
+                writer.writerow([scheduler_id, workload_id, latency])
+                out_f.flush()
+
+    print(f"\nOutput: {csv_path}")
 
 
 def analyze_08_adapt_speed(prototype: bool) -> None:

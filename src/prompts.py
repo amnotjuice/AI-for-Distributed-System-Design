@@ -117,14 +117,15 @@ Design a scheduling policy that minimizes the following objective (lower is bett
 
 For each pipeline, assign a latency value:
   - Completed pipeline: actual end-to-end latency in seconds
-  - Failed or incomplete pipeline: 720 seconds (= max_job_time × 2)
+  - Incomplete or failed pipeline: 2 × max_job_seconds (e.g. 720s if max_job_seconds=360)
 
-Then compute a weighted average across all arrived pipelines:
+These per-pipeline latencies are then combined into a weighted average across all arrived pipelines:
   score = (sum of query_latency × 10  +  sum of interactive_latency × 5  +  sum of batch_latency × 1)
           / (query_arrivals × 10  +  interactive_arrivals × 5  +  batch_arrivals × 1)
 
 Priority weights: query=10x, interactive=5x, batch=1x.
-Failing or dropping pipelines is heavily penalized — aim for high completion rate alongside low latency.
+Incomplete and failed pipelines directly inflate the score through the penalty term — they are not ignored.
+Aim for high completion rate alongside low latency.
 
 ## Estimator
 
@@ -168,14 +169,15 @@ Design a scheduling policy that minimizes the following objective (lower is bett
 
 For each pipeline, assign a latency value:
   - Completed pipeline: actual end-to-end latency in seconds
-  - Failed or incomplete pipeline: 720 seconds (= max_job_time × 2)
+  - Incomplete or failed pipeline: 2 × max_job_seconds (e.g. 720s if max_job_seconds=360)
 
-Then compute a weighted average across all arrived pipelines:
+These per-pipeline latencies are then combined into a weighted average across all arrived pipelines:
   score = (sum of query_latency × 10  +  sum of interactive_latency × 5  +  sum of batch_latency × 1)
           / (query_arrivals × 10  +  interactive_arrivals × 5  +  batch_arrivals × 1)
 
 Priority weights: query=10x, interactive=5x, batch=1x.
-Failing or dropping pipelines is heavily penalized — aim for high completion rate alongside low latency.
+Incomplete and failed pipelines directly inflate the score through the penalty term — they are not ignored.
+Aim for high completion rate alongside low latency.
 
 ## Guidelines
 
@@ -230,13 +232,14 @@ def get_iteration_feedback_prompt(
 
 For each pipeline, assign a latency value:
   - Completed pipeline: actual end-to-end latency in seconds
-  - Failed or incomplete pipeline: 720 seconds (= max_job_time × 2)
+  - Incomplete or failed pipeline: 2 × max_job_seconds (e.g. 720s if max_job_seconds=360)
 
-Then compute a weighted average across all arrived pipelines:
+These per-pipeline latencies are then combined into a weighted average across all arrived pipelines:
   score = (sum of query_latency × 10 + sum of interactive_latency × 5 + sum of batch_latency × 1)
         / (query_arrivals × 10 + interactive_arrivals × 5 + batch_arrivals × 1)
 
-Dropping or starving pipelines is heavily penalized. High completion rate matters as much as low latency.
+Incomplete and failed pipelines directly inflate the score through the penalty term — they are not ignored.
+High completion rate matters as much as low latency.
 
 ## Performance Results (adjusted latency across cluster sizes)
 

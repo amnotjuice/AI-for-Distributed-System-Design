@@ -598,8 +598,55 @@ def plot_06_multi_iter() -> None:
 
 
 def plot_07_cross_eval() -> None:
-    """Fig 7: cross-eval heatmap."""
-    print("plot_07: not yet implemented")
+    """Fig 7: cross-eval heatmap — scheduler (y-axis) × workload (x-axis) latency."""
+    candidates = sorted((RESULTS_DIR / "07_cross_eval").glob("cross_eval*.csv"))
+    if not candidates:
+        print("  No results yet for 07_cross_eval — run analyze.py 07_cross_eval first")
+        return
+
+    rows_data: dict[str, dict[str, float]] = {}
+    with candidates[-1].open() as f:
+        for row in csv.DictReader(f):
+            try:
+                lat = float(row["latency"])
+            except ValueError:
+                lat = float("nan")
+            rows_data.setdefault(row["scheduler_id"], {})[row["workload_id"]] = lat
+
+    if not rows_data:
+        print("  cross_eval CSV is empty")
+        return
+
+    schedulers = sorted(rows_data)
+    workloads = sorted({w for d in rows_data.values() for w in d})
+    matrix = np.full((len(schedulers), len(workloads)), np.nan)
+    for i, s in enumerate(schedulers):
+        for j, w in enumerate(workloads):
+            matrix[i, j] = rows_data[s].get(w, np.nan)
+
+    cmap = plt.get_cmap("YlOrRd").copy()
+    cmap.set_bad(color="#cccccc")
+
+    fig, ax = plt.subplots(figsize=(4.5, 4.0))
+    im = ax.imshow(np.ma.masked_invalid(matrix), aspect="auto", cmap=cmap, interpolation="nearest")
+
+    cbar = fig.colorbar(im, ax=ax, shrink=0.7, pad=0.02)
+    cbar.set_label("Latency (s)", fontsize=6)
+    cbar.ax.tick_params(labelsize=5)
+
+    ax.set_xticks(np.arange(len(workloads)))
+    ax.set_xticklabels([w.replace("scenario_", "s") for w in workloads],
+                       fontsize=4, rotation=90, ha="center")
+    ax.set_yticks(np.arange(len(schedulers)))
+    ax.set_yticklabels([s.split("_")[-1] for s in schedulers], fontsize=4)
+    ax.set_xlabel("Workload", fontsize=7)
+    ax.set_ylabel("Scheduler", fontsize=7)
+    ax.tick_params(axis="both", length=2)
+    ax.grid(False)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    _save(fig, PLOTS_DIR / "07_cross_eval" / "fig7")
 
 
 def plot_08_adapt_speed() -> None:
