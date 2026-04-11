@@ -443,10 +443,24 @@ def analyze_02_estimation(prototype: bool, workers: int = 1, phase: str = "all")
         # Evaluate under each sigma condition
         out_base = RESULTS_DIR / "02_estimation"
         for sigma_str, sigma_params in ESTIMATOR_CONDITIONS.items():
-            params = base_params.copy()
-            params.update(sigma_params)
             out_dir = out_base / sigma_str
             print(f"\n--- Latency: {sigma_str} ---")
+
+            if sigma_str == "no_estimation":
+                src_jsonl = RESULTS_DIR / "01_reasoning" / "low" / "analysis.jsonl"
+                out_dir.mkdir(parents=True, exist_ok=True)
+                dst_jsonl = out_dir / "analysis.jsonl"
+                if src_jsonl.exists():
+                    import shutil
+                    shutil.copy2(src_jsonl, dst_jsonl)
+                    print(f"  [Retrieved] Data directly copied from {src_jsonl}")
+                    continue
+                else:
+                    print(f"  WARNING: {src_jsonl} not found. Falling back to generating data manually.")
+                    # Let it fall through instead of continue
+
+            params = base_params.copy()
+            params.update(sigma_params)
             run_analyze([sched_dir], trace_files, out_dir, params, exp_label=f"estimation={sigma_str}")
 
 

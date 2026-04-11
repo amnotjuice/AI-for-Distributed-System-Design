@@ -66,10 +66,9 @@ SUPPORTED_EFFORTS = ["none", "low", "medium", "high"]
 # Estimation conditions: maps label → sim param overrides
 ESTIMATOR_CONDITIONS = {
     "no_estimation": {},  # no estimator at all
-    "sigma_0.0": {"estimator_algo": "noisy", "noisy_estimator_sigma": 0.0},   # oracle
-    "sigma_0.5": {"estimator_algo": "noisy", "noisy_estimator_sigma": 0.5},   # low noise
-    "sigma_1.0": {"estimator_algo": "noisy", "noisy_estimator_sigma": 1.0},   # medium noise
-    "sigma_1.5": {"estimator_algo": "noisy", "noisy_estimator_sigma": 1.5},   # high noise
+    "sigma_0.0": {"estimator_algo": "noisy", "noisy_estimator_sigma": 0.0},     # oracle
+    "sigma_0.75": {"estimator_algo": "noisy", "noisy_estimator_sigma": 0.75},   # medium noise
+    "sigma_1.5": {"estimator_algo": "noisy", "noisy_estimator_sigma": 1.5},     # high noise
 }
 
 # Feedback modes for iteration experiments
