@@ -24,6 +24,7 @@ import statistics
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import suppress
 from pathlib import Path
 
@@ -294,6 +295,28 @@ def load_existing_records(output_path: Path) -> dict[str, dict]:
     return existing
 
 
+def _evaluate_one(
+    fp: Path,
+    trace_files: list[str],
+    baseline_med: float,
+    metric: str,
+    base_params: dict,
+) -> dict:
+    """Build a complete record for a single scheduler file (usable as worker)."""
+    t0 = time.time()
+    record = {
+        "filename": fp.name,
+        "scheduler_dir": str(fp.parent.name),
+        "baseline_median": baseline_med,
+        "metric": metric,
+        **parse_header(fp),
+        **static_analysis(fp),
+        **evaluate(fp, trace_files, baseline_med, metric, base_params),
+        "simulation_seconds": round(time.time() - t0, 2),
+    }
+    return record
+
+
 def run_analyze(
     scheduler_dirs: list[Path],
     trace_files: list[str],
@@ -301,6 +324,7 @@ def run_analyze(
     base_params: dict,
     metric: str = "latency",
     exp_label: str = "",
+    workers: int = 1,
 ) -> None:
     """Evaluate all schedulers in the given dirs and write JSONL to output_dir."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -329,39 +353,48 @@ def run_analyze(
     for d in scheduler_dirs:
         scheduler_files.extend(sorted(d.glob("scheduler_*.py")))
     assert scheduler_files, f"No scheduler_*.py found in {scheduler_dirs}"
-    print(f"{len(trace_files)} traces | {len(scheduler_files)} schedulers | metric={metric}{' | ' + exp_label if exp_label else ''}")
+    print(f"{len(trace_files)} traces | {len(scheduler_files)} schedulers | metric={metric}"
+          f"{' | ' + exp_label if exp_label else ''} | workers={workers}")
 
     if existing:
         print(f"Resuming: {len(existing)} existing records")
 
-    all_records = dict(existing)
-    with output_path.open("a") as out_f:
-        for i, fp in enumerate(scheduler_files, 1):
-            if fp.name in existing:
-                print(f"[{i}/{len(scheduler_files)}] {fp.name}  already recorded")
-                continue
-            print(f"[{i}/{len(scheduler_files)}] {fp.name}")
-            t0 = time.time()
-            record = {
-                "filename": fp.name,
-                "scheduler_dir": str(fp.parent.name),
-                "baseline_median": baseline_med,
-                "metric": metric,
-                **parse_header(fp),
-                **static_analysis(fp),
-                **evaluate(fp, trace_files, baseline_med, metric, base_params),
-                "simulation_seconds": round(time.time() - t0, 2),
-            }
-            all_records[fp.name] = record
-            out_f.write(json.dumps(record) + "\n")
-            out_f.flush()
-            with suppress(OSError):
-                os.fsync(out_f.fileno())
+    pending = [fp for fp in scheduler_files if fp.name not in existing]
+    for fp in scheduler_files:
+        if fp.name in existing:
+            print(f"[skip] {fp.name}  already recorded")
 
-            ok = "OK" if record["functional"] else "FAIL"
-            detail = (f"{metric}={record.get(f'median_{metric}', 'N/A')}"
-                      if record["functional"] else record.get("failure_mode", ""))
-            print(f"  {ok} {detail}")
+    all_records = dict(existing)
+    total = len(pending)
+
+    def _append_record(fp: Path, record: dict, idx: int, out_f) -> None:
+        all_records[fp.name] = record
+        out_f.write(json.dumps(record) + "\n")
+        out_f.flush()
+        with suppress(OSError):
+            os.fsync(out_f.fileno())
+        ok = "OK" if record["functional"] else "FAIL"
+        detail = (f"{metric}={record.get(f'median_{metric}', 'N/A')}"
+                  if record["functional"] else record.get("failure_mode", ""))
+        print(f"[{idx}/{total}] {fp.name}  {ok} {detail}")
+
+    with output_path.open("a") as out_f:
+        if workers <= 1:
+            for i, fp in enumerate(pending, 1):
+                record = _evaluate_one(fp, trace_files, baseline_med, metric, base_params)
+                _append_record(fp, record, i, out_f)
+        else:
+            completed = 0
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = {
+                    executor.submit(_evaluate_one, fp, trace_files, baseline_med, metric, base_params): fp
+                    for fp in pending
+                }
+                for future in as_completed(futures):
+                    fp = futures[future]
+                    record = future.result()
+                    completed += 1
+                    _append_record(fp, record, completed, out_f)
 
     # Cleanup stray utility logs (eudoxia writes these to cwd = project root)
     for p in PROJECT_ROOT.glob("pool_*_utility.csv"):
@@ -417,7 +450,8 @@ def analyze_01_reasoning(prototype: bool, workers: int = 1, phase: str = "all") 
 
         if phase in ("all", "latency"):
             print(f"\n--- Latency: {effort} ---")
-            run_analyze([sched_dir], trace_files, out_dir, base_params, exp_label=f"reasoning={effort}")
+            run_analyze([sched_dir], trace_files, out_dir, base_params,
+                        exp_label=f"reasoning={effort}", workers=workers)
 
 
 def analyze_02_estimation(prototype: bool, workers: int = 1, phase: str = "all") -> None:
@@ -461,7 +495,8 @@ def analyze_02_estimation(prototype: bool, workers: int = 1, phase: str = "all")
 
             params = base_params.copy()
             params.update(sigma_params)
-            run_analyze([sched_dir], trace_files, out_dir, params, exp_label=f"estimation={sigma_str}")
+            run_analyze([sched_dir], trace_files, out_dir, params,
+                        exp_label=f"estimation={sigma_str}", workers=workers)
 
 
 def analyze_03_two_iter_best_worst(prototype: bool, workers: int = 1) -> None:
@@ -487,7 +522,7 @@ def analyze_03_two_iter_best_worst(prototype: bool, workers: int = 1) -> None:
         out_dir = RESULTS_DIR / "03_two_iter" / combo
         print(f"\n--- Latency: {combo} ---")
         run_analyze([sched_dir], trace_files, out_dir, base_params.copy(),
-                    exp_label=f"two_iter={combo}")
+                    exp_label=f"two_iter={combo}", workers=workers)
 
         # Write summary: % improved over source scheduler
         meta_path = sched_dir / "meta.json"
@@ -671,7 +706,7 @@ def analyze_04_two_iter_all(prototype: bool) -> None:
     print(f"Output: {output_path}")
 
 
-def analyze_05_two_shot_perf(prototype: bool) -> None:
+def analyze_05_two_shot_perf(prototype: bool, workers: int = 1) -> None:
     """Fig 5: two-shot perf with shorter/coarser simulations."""
     base_params = get_canonical_base_params(prototype=prototype)
     canonical = TRACES_DIR / "bench_canonical_train.csv"
@@ -703,7 +738,7 @@ def analyze_05_two_shot_perf(prototype: bool) -> None:
             continue
         print(f"\n--- {label} ---")
         run_analyze([sched_dir], trace_files, out_base / label, base_params.copy(),
-                    exp_label=f"two_shot_perf={label}")
+                    exp_label=f"two_shot_perf={label}", workers=workers)
 
 
 def analyze_06_multi_iter(prototype: bool, dry_run: bool = False) -> None:
@@ -859,7 +894,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--workers", type=int, default=8,
-        help="Number of parallel workers for probe evaluation (default: 8).",
+        help="Number of parallel workers for probe and latency evaluation (default: 8).",
     )
     parser.add_argument(
         "--dry-run", action="store_true",
