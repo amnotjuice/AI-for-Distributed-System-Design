@@ -157,18 +157,30 @@ def extract_metrics_from_stats(
     raw_stats: List[SimulatorStats],
     # metric to return: "latency" or "throughput"
     metric: str = "throughput",
+    # optional sim params — when provided, mirrors eudoxia/__main__.py logic
+    base_params: dict = None,
 ) -> List[float]:
     """Extract metric values from SimulatorStats.
 
-    Args:
-        raw_stats: List of SimulatorStats from get_raw_stats_for_policy
-        metric: Metric to return - either "latency" or "throughput"
-
-    Returns:
-        List of metric values (one per SimulatorStats)
+    When base_params contains max_job_seconds > 0, calls Tyler's adjusted_latency
+    with unfinished_penalty_seconds = 2 * max_job_seconds (requires eudoxia PR #73+).
+    Otherwise falls back to divide_by_completion_rate=True.
     """
     if metric == "latency":
-        return [s.adjusted_latency() for s in raw_stats]
+        from eudoxia.utils import Priority
+        weights = {Priority.QUERY: 10, Priority.INTERACTIVE: 5, Priority.BATCH_PIPELINE: 1}
+        max_job_seconds = (base_params or {}).get("max_job_seconds", 0)
+        if max_job_seconds and max_job_seconds > 0:
+            penalty = 2 * max_job_seconds
+            return [s.adjusted_latency(
+                weights=weights,
+                divide_by_completion_rate=False,
+                unfinished_penalty_seconds=penalty,
+            ) for s in raw_stats]
+        return [s.adjusted_latency(
+            weights=weights,
+            divide_by_completion_rate=True,
+        ) for s in raw_stats]
     else:
         assert metric == "throughput", f"Unknown metric: {metric}"
         return [s.throughput for s in raw_stats]
@@ -206,4 +218,4 @@ def get_stats_for_policy(
         List of metric values (one per trace file)
     """
     raw_stats = get_raw_stats_for_policy(base_params, trace_files, policy_algorithm)
-    return extract_metrics_from_stats(raw_stats, metric)
+    return extract_metrics_from_stats(raw_stats, metric, base_params=base_params)

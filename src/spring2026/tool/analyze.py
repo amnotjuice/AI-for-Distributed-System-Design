@@ -37,11 +37,13 @@ from spring2026.tool.config import (
     ESTIMATOR_CONDITIONS,
     EXPERIMENTS,
     EXPERIMENTS_DIR,
+    PROJECT_ROOT,
     PROTOTYPE_OVERRIDES,
     RESULTS_DIR,
     SCHEDULERS_DIR,
     SPRING2026_DIR,
     TRACES_DIR,
+    TWO_SHOT_PERF_CONDITIONS,
     get_canonical_base_params,
     wilson_interval,
 )
@@ -140,49 +142,92 @@ def _evaluate_scheduler_worker(
                 "error_message": f"Got {len(raw)}/{expected} results",
             }
 
-        values = [float(v) for v in extract_metrics_from_stats(raw, metric)]
+        values = [float(v) for v in extract_metrics_from_stats(raw, metric, base_params=base_params)]
         med = float(statistics.median(values))
         beats = bool(med < baseline_median) if metric == "latency" else bool(med > baseline_median)
         imp = float((med - baseline_median) / baseline_median * 100) if baseline_median else None
 
-        ram_means = [s.ram_utilization_mean for s in raw if getattr(s, "ram_utilization_mean", None) is not None]
-        oom_count = sum(s.failure_error_counts.get("OOM", 0) for s in raw if hasattr(s, "failure_error_counts"))
-        total_suspensions = sum(s.suspensions for s in raw if hasattr(s, "suspensions"))
-        total_assignments = sum(s.assignments for s in raw if hasattr(s, "assignments"))
-        total_arrivals = sum(s.pipelines_all.arrival_count for s in raw if hasattr(s, "pipelines_all"))
-        total_completions = sum(s.pipelines_all.completion_count for s in raw if hasattr(s, "pipelines_all"))
+        # --- Tyler SimulatorStats fields (exact names, summed/meaned across runs) ---
+        total_pipelines_created = sum(s.pipelines_created for s in raw)
+        total_containers_completed = sum(s.containers_completed for s in raw)
+        throughput = statistics.mean(s.throughput for s in raw)
+        p99_latency = statistics.mean(s.p99_latency for s in raw)
+        total_assignments = sum(s.assignments for s in raw)
+        total_suspensions = sum(s.suspensions for s in raw)
+        total_failures = sum(s.failures for s in raw)
+        mean_memory_allocated_percent = statistics.mean(s.mean_memory_allocated_percent for s in raw)
+        mean_memory_consumed_percent = statistics.mean(s.mean_memory_consumed_percent for s in raw)
+        failure_error_counts: dict = {}
+        for s in raw:
+            for k, v in s.failure_error_counts.items():
+                failure_error_counts[k] = failure_error_counts.get(k, 0) + v
+
+        # --- Tyler PipelineStats fields (flattened with category prefix) ---
+        def _agg_pipeline_stats(attr: str) -> dict:
+            arrivals = sum(getattr(s, attr).arrival_count for s in raw)
+            completions = sum(getattr(s, attr).completion_count for s in raw)
+            timeouts = sum(getattr(s, attr).timeout_count for s in raw)
+            w_lat = sum(
+                getattr(s, attr).mean_latency_seconds * getattr(s, attr).completion_count
+                for s in raw if getattr(s, attr).completion_count > 0
+            )
+            w_count = sum(getattr(s, attr).completion_count for s in raw)
+            mean_latency_seconds = w_lat / w_count if w_count > 0 else None
+            p99s = [getattr(s, attr).p99_latency_seconds for s in raw
+                    if getattr(s, attr).completion_count > 0]
+            p99_latency_seconds = statistics.mean(p99s) if p99s else None
+            return {
+                f"{attr}_arrival_count": arrivals,
+                f"{attr}_completion_count": completions,
+                f"{attr}_timeout_count": timeouts,
+                f"{attr}_mean_latency_seconds": mean_latency_seconds,
+                f"{attr}_p99_latency_seconds": p99_latency_seconds,
+            }
+
+        ps_all = _agg_pipeline_stats("pipelines_all")
+        ps_query = _agg_pipeline_stats("pipelines_query")
+        ps_interactive = _agg_pipeline_stats("pipelines_interactive")
+        ps_batch = _agg_pipeline_stats("pipelines_batch")
+
+        # --- Derived fields (not directly in Tyler, use old naming convention) ---
+        oom_count = failure_error_counts.get("OOM", 0)
+        total_arrivals = ps_all["pipelines_all_arrival_count"]
+        total_completions = ps_all["pipelines_all_completion_count"]
         completion_rate = total_completions / total_arrivals if total_arrivals > 0 else None
+        suspension_rate = total_suspensions / total_assignments if total_assignments > 0 else None
 
-        def _weighted_mean_latency_seconds(attr):
-            weighted_sum, weight_total = 0.0, 0
-            for s in raw:
-                stats = getattr(s, attr, None)
-                if stats and stats.completion_count > 0:
-                    weighted_sum += stats.mean_latency_seconds * stats.completion_count
-                    weight_total += stats.completion_count
-            return weighted_sum / weight_total if weight_total > 0 else None
-
-        def _completion_rate(attr):
-            arrivals = sum(getattr(s, attr).arrival_count for s in raw if hasattr(s, attr))
-            completions = sum(getattr(s, attr).completion_count for s in raw if hasattr(s, attr))
-            return completions / arrivals if arrivals > 0 else None
+        def _completion_rate(ps: dict, attr: str) -> float | None:
+            arr = ps[f"{attr}_arrival_count"]
+            comp = ps[f"{attr}_completion_count"]
+            return comp / arr if arr > 0 else None
 
         return {
             "functional": True, "failure_mode": "success",
             f"median_{metric}": med, "metric_values": values,
             "beats_baseline": beats, "improvement_pct": imp,
-            "ram_utilization_mean": float(statistics.mean(ram_means)) if ram_means else None,
-            "oom_count": oom_count,
-            "suspensions": total_suspensions,
+            # Tyler SimulatorStats (exact names)
+            "pipelines_created": total_pipelines_created,
+            "containers_completed": total_containers_completed,
+            "throughput": throughput,
+            "p99_latency": p99_latency,
             "assignments": total_assignments,
-            "suspension_rate": total_suspensions / total_assignments if total_assignments > 0 else None,
+            "suspensions": total_suspensions,
+            "failures": total_failures,
+            "failure_error_counts": failure_error_counts,
+            "mean_memory_allocated_percent": mean_memory_allocated_percent,
+            "mean_memory_consumed_percent": mean_memory_consumed_percent,
+            # Tyler PipelineStats (exact names, flattened)
+            **ps_all,
+            **ps_query,
+            **ps_interactive,
+            **ps_batch,
+            # Derived
+            "oom_count": oom_count,
+            "suspension_rate": suspension_rate,
             "completion_rate": completion_rate,
-            "latency_query_s": _weighted_mean_latency_seconds("pipelines_query"),
-            "latency_interactive_s": _weighted_mean_latency_seconds("pipelines_interactive"),
-            "latency_batch_s": _weighted_mean_latency_seconds("pipelines_batch"),
-            "completion_rate_query": _completion_rate("pipelines_query"),
-            "completion_rate_interactive": _completion_rate("pipelines_interactive"),
-            "completion_rate_batch": _completion_rate("pipelines_batch"),
+            "completion_rate_query": _completion_rate(ps_query, "pipelines_query"),
+            "completion_rate_interactive": _completion_rate(ps_interactive, "pipelines_interactive"),
+            "completion_rate_batch": _completion_rate(ps_batch, "pipelines_batch"),
         }
     except Exception as e:
         return {"functional": False, "failure_mode": "simulation_error", "error_message": str(e)}
@@ -277,7 +322,7 @@ def run_analyze(
     else:
         naive_raw = get_raw_stats_for_policy(baseline_params, trace_files, "naive")
         assert len(naive_raw) == len(trace_files), "Baseline failed"
-    baseline_med = statistics.median(extract_metrics_from_stats(naive_raw, metric))
+    baseline_med = statistics.median(extract_metrics_from_stats(naive_raw, metric, base_params=baseline_params))
     print(f"Baseline median {metric}: {baseline_med:.4f}")
 
     scheduler_files = []
@@ -318,8 +363,8 @@ def run_analyze(
                       if record["functional"] else record.get("failure_mode", ""))
             print(f"  {ok} {detail}")
 
-    # Cleanup stray utility logs
-    for p in _SRC.glob("pool_*_utility.csv"):
+    # Cleanup stray utility logs (eudoxia writes these to cwd = project root)
+    for p in PROJECT_ROOT.glob("pool_*_utility.csv"):
         p.unlink(missing_ok=True)
 
     all_list = [all_records[fp.name] for fp in scheduler_files if fp.name in all_records]
@@ -351,7 +396,7 @@ def _run_probes_for_dir(sched_dir: Path, out_dir: Path, base_params: dict, worke
     write_csv(scheduler_files, all_results, out_dir / "probes.csv")
 
 
-def analyze_01_reasoning(prototype: bool, workers: int = 1) -> None:
+def analyze_01_reasoning(prototype: bool, workers: int = 1, phase: str = "all") -> None:
     """Fig 1: one-shot, vary reasoning level, no estimation."""
     base_params = get_canonical_base_params(prototype=prototype)
     canonical = TRACES_DIR / "bench_canonical_train.csv"
@@ -366,14 +411,16 @@ def analyze_01_reasoning(prototype: bool, workers: int = 1) -> None:
             continue
         out_dir = RESULTS_DIR / "01_reasoning" / effort
 
-        print(f"\n--- Probes: {effort} ---")
-        _run_probes_for_dir(sched_dir, out_dir, base_params, workers=workers)
+        if phase in ("all", "probe"):
+            print(f"\n--- Probes: {effort} ---")
+            _run_probes_for_dir(sched_dir, out_dir, base_params, workers=workers)
 
-        print(f"\n--- Latency: {effort} ---")
-        run_analyze([sched_dir], trace_files, out_dir, base_params, exp_label=f"reasoning={effort}")
+        if phase in ("all", "latency"):
+            print(f"\n--- Latency: {effort} ---")
+            run_analyze([sched_dir], trace_files, out_dir, base_params, exp_label=f"reasoning={effort}")
 
 
-def analyze_02_estimation(prototype: bool, workers: int = 1) -> None:
+def analyze_02_estimation(prototype: bool, workers: int = 1, phase: str = "all") -> None:
     """Fig 2: one-shot, vary estimation noise, medium reasoning."""
     sched_dir = SCHEDULERS_DIR / "estimation"
     if not sched_dir.exists() or not list(sched_dir.glob("scheduler_*.py")):
@@ -386,18 +433,21 @@ def analyze_02_estimation(prototype: bool, workers: int = 1) -> None:
     trace_files = [str(canonical)]
     base_params["_cluster_sizes"] = [1, 2, 4, 8, 16]
 
-    # Run probes once for the estimation schedulers
-    out_base = RESULTS_DIR / "02_estimation"
-    print("\n--- Probes: estimation ---")
-    _run_probes_for_dir(sched_dir, out_base, base_params, workers=workers)
+    if phase in ("all", "probe"):
+        # Run probes once for the estimation schedulers
+        out_base = RESULTS_DIR / "02_estimation"
+        print("\n--- Probes: estimation ---")
+        _run_probes_for_dir(sched_dir, out_base, base_params, workers=workers)
 
-    # Evaluate under each sigma condition
-    for sigma_str, sigma_params in ESTIMATOR_CONDITIONS.items():
-        params = base_params.copy()
-        params.update(sigma_params)
-        out_dir = out_base / sigma_str
-        print(f"\n--- Latency: {sigma_str} ---")
-        run_analyze([sched_dir], trace_files, out_dir, params, exp_label=f"estimation={sigma_str}")
+    if phase in ("all", "latency"):
+        # Evaluate under each sigma condition
+        out_base = RESULTS_DIR / "02_estimation"
+        for sigma_str, sigma_params in ESTIMATOR_CONDITIONS.items():
+            params = base_params.copy()
+            params.update(sigma_params)
+            out_dir = out_base / sigma_str
+            print(f"\n--- Latency: {sigma_str} ---")
+            run_analyze([sched_dir], trace_files, out_dir, params, exp_label=f"estimation={sigma_str}")
 
 
 def analyze_03_two_iter_best_worst(prototype: bool, workers: int = 1) -> None:
@@ -467,13 +517,179 @@ def analyze_03_two_iter_best_worst(prototype: bool, workers: int = 1) -> None:
 
 
 def analyze_04_two_iter_all(prototype: bool) -> None:
-    """Fig 4: two-iteration, all contexts, % time v2 beats v1."""
-    print("analyze_04: not yet implemented")
+    """Fig 4: two-iteration, median source, evaluate v2 on all 10 train traces."""
+    base_params = get_canonical_base_params(prototype=prototype)
+    base_params["_cluster_sizes"] = [1, 2, 4, 8, 16]
+    cluster_sizes = base_params["_cluster_sizes"]
+
+    all_trace_paths = sorted(TRACES_DIR.glob("bench_*_train.csv"))
+    assert all_trace_paths, f"No bench_*_train.csv found in {TRACES_DIR}"
+    trace_files = [str(p) for p in all_trace_paths]
+    trace_names = [p.name for p in all_trace_paths]
+    n_traces = len(trace_files)
+    n_clusters = len(cluster_sizes)
+
+    out_dir = RESULTS_DIR / "04_two_iter_all"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    output_path = out_dir / "analysis.jsonl"
+    existing = load_existing_records(output_path)
+
+    # --- Source: median scheduler from 01_reasoning/low ---
+    analysis_01 = RESULTS_DIR / "01_reasoning" / "low" / "analysis.jsonl"
+    assert analysis_01.exists(), "Run analyze.py 01_reasoning first"
+    src_pool = [r for r in load_existing_records(analysis_01).values()
+                if r.get("functional") and r.get("median_latency") is not None]
+    assert src_pool, "No functional schedulers in 01_reasoning/low"
+    med_val = statistics.median(r["median_latency"] for r in src_pool)
+    source_record = min(src_pool, key=lambda r: abs(r["median_latency"] - med_val))
+    source_file = SCHEDULERS_DIR / "reasoning" / "low" / source_record["filename"]
+    assert source_file.exists(), f"Source file not found: {source_file}"
+
+    # --- Evaluate source on all traces (cached) ---
+    source_cache = out_dir / "source.json"
+    if source_cache.exists():
+        source_data = json.loads(source_cache.read_text())
+        if source_data["filename"] != source_record["filename"]:
+            print(f"  Cache mismatch: cached={source_data['filename']}, "
+                  f"current median={source_record['filename']} — re-evaluating.")
+            source_cache.unlink()
+            source_data = None
+        else:
+            print(f"Source (cached): {source_data['filename']}")
+    else:
+        source_data = None
+
+    if source_data is None:
+        print(f"Evaluating source: {source_record['filename']} on {n_traces} traces...")
+        result = evaluate(source_file, trace_files, 0.0, "latency", base_params.copy())
+        assert result.get("functional"), f"Source scheduler failed: {result.get('failure_mode')}"
+        vals = result["metric_values"]
+        per_trace_latency = {}
+        for j, name in enumerate(trace_names):
+            trace_vals = [vals[i * n_traces + j] for i in range(n_clusters)
+                          if i * n_traces + j < len(vals)]
+            finite = [v for v in trace_vals if v != float("inf")]
+            per_trace_latency[name] = statistics.median(finite) if finite else float("inf")
+        source_data = {
+            "filename": source_record["filename"],
+            "exp01_median_latency": source_record["median_latency"],
+            "per_trace_latency": per_trace_latency,
+        }
+        source_cache.write_text(json.dumps(source_data, indent=2))
+        print(f"  Source per-trace latencies saved.")
+
+    per_trace_source = source_data["per_trace_latency"]
+
+    # --- Collect v2 schedulers from median_simple and median_rich ---
+    scheduler_files: list[tuple[Path, str]] = []
+    for ctx in ["simple", "rich"]:
+        sched_dir = SCHEDULERS_DIR / "two_iter" / f"median_{ctx}"
+        if not sched_dir.exists() or not list(sched_dir.glob("scheduler_*.py")):
+            print(f"  SKIP median_{ctx}: no schedulers in {sched_dir}")
+            continue
+        scheduler_files.extend((fp, ctx) for fp in sorted(sched_dir.glob("scheduler_*.py")))
+
+    if not scheduler_files:
+        print("No v2 schedulers found. Run: python generate.py --exp two_iter --source median --context simple/rich")
+        return
+
+    print(f"{n_traces} traces | {len(scheduler_files)} v2 schedulers")
+    if existing:
+        print(f"Resuming: {len(existing)} existing records")
+
+    with output_path.open("a") as out_f:
+        for i, (fp, ctx) in enumerate(scheduler_files, 1):
+            if fp.name in existing:
+                print(f"[{i}/{len(scheduler_files)}] {fp.name}  already recorded")
+                continue
+            print(f"[{i}/{len(scheduler_files)}] {fp.name}  (context={ctx})")
+            t0 = time.time()
+            result = evaluate(fp, trace_files, 0.0, "latency", base_params.copy())
+
+            per_trace_latency: dict[str, float] = {}
+            per_trace_beats: dict[str, bool] = {}
+            beats_count = 0
+
+            if result.get("functional") and result.get("metric_values"):
+                vals = result["metric_values"]
+                for j, name in enumerate(trace_names):
+                    trace_vals = [vals[i * n_traces + j] for i in range(n_clusters)
+                                  if i * n_traces + j < len(vals)]
+                    finite = [v for v in trace_vals if v != float("inf")]
+                    v2_lat = statistics.median(finite) if finite else float("inf")
+                    src_lat = per_trace_source.get(name, float("inf"))
+                    per_trace_latency[name] = v2_lat
+                    per_trace_beats[name] = bool(v2_lat < src_lat)
+                    if v2_lat < src_lat:
+                        beats_count += 1
+
+            record = {
+                "filename": fp.name,
+                "context": ctx,
+                "source_filename": source_data["filename"],
+                **parse_header(fp),
+                "functional": result.get("functional", False),
+                "failure_mode": result.get("failure_mode", "unknown"),
+                "per_trace_latency": per_trace_latency,
+                "per_trace_beats_source": per_trace_beats,
+                "beats_source_count": beats_count,
+                "n_traces": n_traces,
+                "simulation_seconds": round(time.time() - t0, 2),
+            }
+            out_f.write(json.dumps(record) + "\n")
+            out_f.flush()
+            with suppress(OSError):
+                os.fsync(out_f.fileno())
+
+            status = "OK" if record["functional"] else "FAIL"
+            print(f"  {status}  beats_source={beats_count}/{n_traces}")
+
+    # --- Summary ---
+    all_records = list(load_existing_records(output_path).values())
+    print("=" * 50)
+    for ctx in ["simple", "rich"]:
+        ctx_recs = [r for r in all_records if r.get("context") == ctx and r.get("functional")]
+        if not ctx_recs:
+            continue
+        total = sum(r["n_traces"] for r in ctx_recs)
+        beats = sum(r["beats_source_count"] for r in ctx_recs)
+        print(f"{ctx}: {beats}/{total} ({beats/total:.1%}) (scheduler, trace) pairs beat source")
+    print(f"Output: {output_path}")
 
 
 def analyze_05_two_shot_perf(prototype: bool) -> None:
     """Fig 5: two-shot perf with shorter/coarser simulations."""
-    print("analyze_05: not yet implemented")
+    base_params = get_canonical_base_params(prototype=prototype)
+    canonical = TRACES_DIR / "bench_canonical_train.csv"
+    assert canonical.exists(), f"Canonical trace not found: {canonical}"
+    trace_files = [str(canonical)]
+    base_params["_cluster_sizes"] = [1, 2, 4, 8, 16]
+
+    # Source latency (full sim) from exp01/low — reuse existing analysis
+    analysis_01 = RESULTS_DIR / "01_reasoning" / "low" / "analysis.jsonl"
+    assert analysis_01.exists(), "Run analyze.py 01_reasoning first"
+    src_pool = [r for r in load_existing_records(analysis_01).values()
+                if r.get("functional") and r.get("median_latency") is not None]
+    assert src_pool, "No functional schedulers in 01_reasoning/low"
+    med_val = statistics.median(r["median_latency"] for r in src_pool)
+    source_record = min(src_pool, key=lambda r: abs(r["median_latency"] - med_val))
+    print(f"Source: {source_record['filename']}  full-sim latency={source_record['median_latency']:.4f}")
+
+    out_base = RESULTS_DIR / "05_two_shot_perf"
+    out_base.mkdir(parents=True, exist_ok=True)
+    (out_base / "source.json").write_text(json.dumps({
+        "filename": source_record["filename"],
+        "full_sim_median_latency": source_record["median_latency"],
+    }, indent=2))
+
+    for label in TWO_SHOT_PERF_CONDITIONS:
+        sched_dir = SCHEDULERS_DIR / "two_shot_perf" / label
+        if not sched_dir.exists() or not list(sched_dir.glob("scheduler_*.py")):
+            print(f"  SKIP {label}: no schedulers")
+            continue
+        print(f"\n--- {label} ---")
+        run_analyze([sched_dir], trace_files, out_base / label, base_params.copy(),
+                    exp_label=f"two_shot_perf={label}")
 
 
 def analyze_06_multi_iter(prototype: bool, dry_run: bool = False) -> None:
@@ -616,6 +832,14 @@ def main() -> None:
         help="Experiment to analyze, or 'all' to run all",
     )
     parser.add_argument(
+        "phase",
+        nargs="?",
+        default="all",
+        choices=["all", "latency", "probe"],
+        help="Phase to run: 'latency', 'probe', or 'all' (default: all). "
+             "Only applies to experiments that support it (01_reasoning, 02_estimation).",
+    )
+    parser.add_argument(
         "--prototype", action="store_true",
         help="Fast/cheap run (1-min sims, validates infra only)",
     )
@@ -635,6 +859,8 @@ def main() -> None:
         print(f"Experiment: {exp} — {EXPERIMENTS.get(exp, '')}")
         if args.prototype:
             print("  [PROTOTYPE MODE — results not meaningful]")
+        if args.phase != "all":
+            print(f"  [PHASE: {args.phase} only]")
         print("=" * 60)
         handler = HANDLERS[exp]
         sig = inspect.signature(handler).parameters
@@ -643,6 +869,8 @@ def main() -> None:
             kwargs["workers"] = args.workers
         if "dry_run" in sig:
             kwargs["dry_run"] = args.dry_run
+        if "phase" in sig:
+            kwargs["phase"] = args.phase
         handler(**kwargs)
 
 

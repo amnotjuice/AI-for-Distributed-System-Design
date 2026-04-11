@@ -14,7 +14,7 @@ PARAM_OVERRIDES = {
 }
 
 N_SCHEDULERS = 50
-REASONING_EFFORT = "medium"
+REASONING_EFFORT = "low"
 # Keys into config.ESTIMATOR_CONDITIONS
 ESTIMATION_CONDITIONS = ["no_estimation", "sigma_0.0", "sigma_0.5", "sigma_1.0", "sigma_1.5"]
 MODEL = "gpt-5.2-2025-12-11"

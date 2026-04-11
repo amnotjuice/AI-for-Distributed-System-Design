@@ -13,7 +13,7 @@ PARAM_OVERRIDES = {
 }
 
 SOURCE_EXPERIMENT = "01_reasoning"
-SELECTIONS = ["best", "avg", "worst"]  # which one-shot schedulers to start from
-FEEDBACK_MODES = ["minimal", "rich"]
+SELECTIONS = ["best", "median", "worst"]  # which one-shot schedulers to start from
+FEEDBACK_MODES = ["simple", "rich"]
 N_ATTEMPTS = 20  # attempts per (selection, feedback_mode) combo
 MODEL = "gpt-5.2-2025-12-11"

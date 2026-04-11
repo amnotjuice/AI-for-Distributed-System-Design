@@ -48,9 +48,9 @@ CANONICAL_SIM_PARAMS = {
     "batch_prob": 0.6,
     "random_seed": 42,
     "per_trace_timeout": None,
-    "subprocess_timeout": None,
-    # Max job time = 6 minutes
-    "max_job_time": 360,
+    "subprocess_timeout": 600,   # 10-min wall clock safety net per scheduler
+    # Max job time = 6 minutes (eudoxia param name: max_job_seconds)
+    "max_job_seconds": 360,
 }
 
 # Prototype mode: fast/cheap, results won't be meaningful but infra is validated
@@ -73,7 +73,16 @@ ESTIMATOR_CONDITIONS = {
 }
 
 # Feedback modes for iteration experiments
-FEEDBACK_MODES = ["minimal", "rich"]
+FEEDBACK_MODES = ["simple", "rich"]
+
+# Two-shot perf conditions: maps label → sim param overrides (one param varied at a time)
+TWO_SHOT_PERF_CONDITIONS = {
+    "dur3600_ticks100": {"duration": 3600, "ticks_per_second": 100},  # full (baseline)
+    "dur1800_ticks100": {"duration": 1800, "ticks_per_second": 100},
+    "dur900_ticks100":  {"duration":  900, "ticks_per_second": 100},
+    "dur3600_ticks50":  {"duration": 3600, "ticks_per_second":  50},
+    "dur3600_ticks25":  {"duration": 3600, "ticks_per_second":  25},
+}
 
 
 def get_canonical_base_params(prototype: bool = False) -> dict:
