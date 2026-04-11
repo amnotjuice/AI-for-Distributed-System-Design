@@ -34,6 +34,7 @@ from spring2026.tool.config import (
     EXPERIMENTS,
     PLOTS_DIR,
     RESULTS_DIR,
+    TWO_SHOT_PERF_CONDITIONS,
     wilson_interval,
 )
 
@@ -128,12 +129,18 @@ def _save(fig: plt.Figure, path: Path) -> None:
 def load_jsonl(path: Path) -> list[dict]:
     if not path.exists():
         return []
-    records = []
+    seen: dict[str, dict] = {}
     for line in path.read_text().splitlines():
         line = line.strip()
-        if line:
-            records.append(json.loads(line))
-    return records
+        if not line:
+            continue
+        record = json.loads(line)
+        fn = record.get("filename")
+        if fn:
+            seen[fn] = record  # last write wins, consistent with load_existing_records
+        else:
+            seen[id(record)] = record
+    return list(seen.values())
 
 
 def load_results(exp_name: str) -> dict[str, list[dict]]:
@@ -552,13 +559,127 @@ def plot_03_two_iter_best_worst() -> None:
 
 
 def plot_04_two_iter_all() -> None:
-    """Fig 4: two-iteration, % time v2 beats v1."""
-    print("plot_04: not yet implemented")
+    """Fig 4: per-trace beat rate for median source, simple vs rich context."""
+    out_dir = RESULTS_DIR / "04_two_iter_all"
+    records = load_jsonl(out_dir / "analysis.jsonl")
+
+    if not records:
+        print("  No results yet for 04_two_iter_all — run analyze.py 04_two_iter_all first")
+        return
+
+    functional = [r for r in records if r.get("functional")]
+    if not functional:
+        print("  No functional v2 schedulers in 04_two_iter_all results")
+        return
+
+    # Collect all trace names in stable order
+    trace_names = sorted({name for r in functional for name in r.get("per_trace_beats_source", {})})
+    short_names = [n.replace("bench_", "").replace("_train.csv", "") for n in trace_names]
+    contexts = ["simple", "rich"]
+
+    # Per-trace beat rate: for each context, fraction of schedulers that beat source
+    beat_rates: dict[str, list[float]] = {ctx: [] for ctx in contexts}
+    for ctx in contexts:
+        ctx_recs = [r for r in functional if r.get("context") == ctx]
+        for trace in trace_names:
+            beats = sum(1 for r in ctx_recs if r.get("per_trace_beats_source", {}).get(trace))
+            beat_rates[ctx].append(beats / len(ctx_recs) * 100 if ctx_recs else 0.0)
+
+    fig, (ax_traces, ax_agg) = plt.subplots(1, 2, figsize=(8, 3),
+                                             gridspec_kw={"width_ratios": [3, 1]})
+
+    x = np.arange(len(trace_names))
+    bar_width = 0.35
+    ctx_colors = {"simple": "#6baed6", "rich": "#08519c"}
+
+    for i, ctx in enumerate(contexts):
+        offset = (i - 0.5) * bar_width
+        ax_traces.bar(x + offset, beat_rates[ctx], bar_width,
+                      label=ctx.capitalize(), color=ctx_colors[ctx], zorder=2)
+
+    ax_traces.set_xticks(x)
+    ax_traces.set_xticklabels(short_names, rotation=45, ha="right", fontsize=7)
+    ax_traces.set_ylabel("% v2 Beat Source", fontsize=8)
+    ax_traces.set_title("(a) Per-Context Beat Rate", fontsize=9)
+    ax_traces.set_ylim(0, 100)
+    ax_traces.axhline(50, color="#aaaaaa", linewidth=0.8, linestyle="--", zorder=1)
+    ax_traces.legend(frameon=False, fontsize=7)
+    _style_axes(ax_traces)
+
+    # Aggregated bar
+    for i, ctx in enumerate(contexts):
+        ctx_recs = [r for r in functional if r.get("context") == ctx]
+        total = sum(r["n_traces"] for r in ctx_recs)
+        beats = sum(r["beats_source_count"] for r in ctx_recs)
+        rate = beats / total * 100 if total else 0
+        n = len(ctx_recs)
+        lo, hi = wilson_interval(beats, total)
+        ax_agg.bar(i, rate, color=ctx_colors[ctx], zorder=2)
+        if total > 0 and lo is not None:
+            ax_agg.errorbar(i, rate, yerr=[[rate - lo * 100], [hi * 100 - rate]],
+                            fmt="none", ecolor="#333", capsize=4, linewidth=1, zorder=3)
+        ax_agg.text(i, rate + 3, f"n={n}", ha="center", fontsize=7)
+
+    ax_agg.set_xticks([0, 1])
+    ax_agg.set_xticklabels(["Simple", "Rich"], fontsize=8)
+    ax_agg.set_ylabel("% (scheduler, trace) pairs beat source", fontsize=7)
+    ax_agg.set_title("(b) Overall", fontsize=9)
+    ax_agg.set_ylim(0, 100)
+    ax_agg.axhline(50, color="#aaaaaa", linewidth=0.8, linestyle="--", zorder=1)
+    _style_axes(ax_agg)
+
+    _save(fig, PLOTS_DIR / "04_two_iter_all" / "fig4")
 
 
 def plot_05_two_shot_perf() -> None:
-    """Fig 5: two-shot perf with shorter simulations."""
-    print("plot_05: not yet implemented")
+    """Fig 5: beat-source rate vs sim fidelity (shorter duration / coarser ticks)."""
+    out_base = RESULTS_DIR / "05_two_shot_perf"
+    source_path = out_base / "source.json"
+    if not source_path.exists():
+        print("  No results yet for 05_two_shot_perf — run analyze.py 05_two_shot_perf first")
+        return
+
+    source_latency = json.loads(source_path.read_text())["full_sim_median_latency"]
+
+    labels, rates, errs, colors = [], [], [], []
+    for label, cond in TWO_SHOT_PERF_CONDITIONS.items():
+        records = load_jsonl(out_base / label / "analysis.jsonl")
+        functional = [r for r in records
+                      if r.get("functional") and r.get("median_latency") is not None]
+        if not functional:
+            continue
+        n = len(functional)
+        beats = sum(1 for r in functional if r["median_latency"] < source_latency)
+        lo, hi = wilson_interval(beats, n)
+        labels.append(label.replace("dur", "d=").replace("_ticks", "\nt="))
+        rates.append(beats / n * 100)
+        errs.append([(beats / n - lo) * 100, (hi - beats / n) * 100])
+        # blue = ticks vary (duration fixed at 3600), orange = duration varies
+        colors.append("#2171b5" if cond["duration"] == 3600 else "#e6550d")
+
+    if not labels:
+        print("  No results yet for 05_two_shot_perf")
+        return
+
+    x = np.arange(len(labels))
+    errs_arr = np.array(errs).T  # shape (2, n)
+
+    fig, ax = plt.subplots(figsize=(max(5.0, len(labels) * 1.4), 4))
+    ax.bar(x, rates, color=colors, zorder=2)
+    ax.errorbar(x, rates, yerr=errs_arr, fmt="none", ecolor="#333",
+                capsize=4, linewidth=1, zorder=3)
+    ax.axhline(50, color="#aaaaaa", linewidth=0.8, linestyle="--")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontsize=8)
+    ax.set_ylabel("% v1 Beat Source", fontsize=9)
+    ax.set_title("Two-Shot Improvement Rate by Sim Fidelity", fontsize=10)
+    ax.set_ylim(0, 100)
+    ax.legend(handles=[
+        Patch(facecolor="#e6550d", label="Shorter duration"),
+        Patch(facecolor="#2171b5", label="Coarser ticks"),
+    ], frameon=False, fontsize=7)
+    _style_axes(ax)
+    _save(fig, PLOTS_DIR / "05_two_shot_perf" / "fig5")
 
 
 def plot_06_multi_iter() -> None:

@@ -48,9 +48,9 @@ CANONICAL_SIM_PARAMS = {
     "batch_prob": 0.6,
     "random_seed": 42,
     "per_trace_timeout": None,
-    "subprocess_timeout": None,
-    # Max job time = 6 minutes
-    "max_job_time": 360,
+    "subprocess_timeout": 600,   # 10-min wall clock safety net per scheduler
+    # Max job time = 6 minutes (eudoxia param name: max_job_seconds)
+    "max_job_seconds": 360,
 }
 
 # Prototype mode: fast/cheap, results won't be meaningful but infra is validated
@@ -66,14 +66,22 @@ SUPPORTED_EFFORTS = ["none", "low", "medium", "high"]
 # Estimation conditions: maps label → sim param overrides
 ESTIMATOR_CONDITIONS = {
     "no_estimation": {},  # no estimator at all
-    "sigma_0.0": {"estimator_algo": "noisy", "noisy_estimator_sigma": 0.0},   # oracle
-    "sigma_0.5": {"estimator_algo": "noisy", "noisy_estimator_sigma": 0.5},   # low noise
-    "sigma_1.0": {"estimator_algo": "noisy", "noisy_estimator_sigma": 1.0},   # medium noise
-    "sigma_1.5": {"estimator_algo": "noisy", "noisy_estimator_sigma": 1.5},   # high noise
+    "sigma_0.0": {"estimator_algo": "noisy", "noisy_estimator_sigma": 0.0},     # oracle
+    "sigma_0.75": {"estimator_algo": "noisy", "noisy_estimator_sigma": 0.75},   # medium noise
+    "sigma_1.5": {"estimator_algo": "noisy", "noisy_estimator_sigma": 1.5},     # high noise
 }
 
 # Feedback modes for iteration experiments
-FEEDBACK_MODES = ["minimal", "rich"]
+FEEDBACK_MODES = ["simple", "rich"]
+
+# Two-shot perf conditions: maps label → sim param overrides (one param varied at a time)
+TWO_SHOT_PERF_CONDITIONS = {
+    "dur3600_ticks100": {"duration": 3600, "ticks_per_second": 100},  # full (baseline)
+    "dur1800_ticks100": {"duration": 1800, "ticks_per_second": 100},
+    "dur900_ticks100":  {"duration":  900, "ticks_per_second": 100},
+    "dur3600_ticks50":  {"duration": 3600, "ticks_per_second":  50},
+    "dur3600_ticks25":  {"duration": 3600, "ticks_per_second":  25},
+}
 
 
 def get_canonical_base_params(prototype: bool = False) -> dict:

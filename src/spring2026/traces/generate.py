@@ -54,7 +54,7 @@ def make_scale_config(batch_size: int, seed: int) -> TraceConfig:
     dag_weights = [0.70, 0.15, 0.15]
 
     return TraceConfig(
-        duration_seconds=600,
+        duration_seconds=DURATION,
         ticks_per_second=1000,
         pipeline_specs=[
             PipelineSpec.query(weight=0.1),
@@ -92,6 +92,7 @@ def make_scale_config(batch_size: int, seed: int) -> TraceConfig:
 
 TRAIN_SEED = 42
 TEST_SEED  = 137
+DURATION   = 3600
 
 _MIXED_DAGS  = ["linear", "branch_in", "branch_out"]
 _MIXED_W     = [0.70, 0.15, 0.15]
@@ -102,7 +103,7 @@ _BRANCH_W    = [0.50, 0.50]
 def _bench_canonical(seed: int) -> TraceConfig:
     """Baseline canonical mix. Reference point for all comparisons."""
     return TraceConfig(
-        duration_seconds=600, ticks_per_second=1000,
+        duration_seconds=DURATION, ticks_per_second=1000,
         pipeline_specs=[
             PipelineSpec.query(weight=0.1),
             PipelineSpec.interactive(weight=0.3, num_ops_mean=8, num_ops_min=1,
@@ -118,7 +119,7 @@ def _bench_canonical(seed: int) -> TraceConfig:
 def _bench_priority_heavy(seed: int) -> TraceConfig:
     """High QUERY + INTERACTIVE ratio. Stresses priority ordering under contention."""
     return TraceConfig(
-        duration_seconds=600, ticks_per_second=1000,
+        duration_seconds=DURATION, ticks_per_second=1000,
         pipeline_specs=[
             PipelineSpec.query(weight=0.4),
             PipelineSpec.interactive(weight=0.4, num_ops_mean=6, num_ops_min=1,
@@ -134,7 +135,7 @@ def _bench_priority_heavy(seed: int) -> TraceConfig:
 def _bench_batch_heavy(seed: int) -> TraceConfig:
     """Mostly BATCH traffic. Stresses throughput and batch starvation avoidance."""
     return TraceConfig(
-        duration_seconds=600, ticks_per_second=1000,
+        duration_seconds=DURATION, ticks_per_second=1000,
         pipeline_specs=[
             PipelineSpec.query(weight=0.05),
             PipelineSpec.interactive(weight=0.10, num_ops_mean=8, num_ops_min=1,
@@ -150,7 +151,7 @@ def _bench_batch_heavy(seed: int) -> TraceConfig:
 def _bench_high_load(seed: int) -> TraceConfig:
     """4x arrival rate. Stresses scheduling speed under sustained backlog."""
     return TraceConfig(
-        duration_seconds=600, ticks_per_second=1000,
+        duration_seconds=DURATION, ticks_per_second=1000,
         pipeline_specs=[
             PipelineSpec.query(weight=0.1),
             PipelineSpec.interactive(weight=0.3, num_ops_mean=8, num_ops_min=1,
@@ -166,7 +167,7 @@ def _bench_high_load(seed: int) -> TraceConfig:
 def _bench_low_load(seed: int) -> TraceConfig:
     """Sparse arrivals. Stresses resource utilization when the system is underloaded."""
     return TraceConfig(
-        duration_seconds=600, ticks_per_second=1000,
+        duration_seconds=DURATION, ticks_per_second=1000,
         pipeline_specs=[
             PipelineSpec.query(weight=0.1),
             PipelineSpec.interactive(weight=0.3, num_ops_mean=8, num_ops_min=1,
@@ -182,7 +183,7 @@ def _bench_low_load(seed: int) -> TraceConfig:
 def _bench_cpu_bound(seed: int) -> TraceConfig:
     """CPU-heavy operator profiles. Stresses CPU allocation and contention."""
     return TraceConfig(
-        duration_seconds=600, ticks_per_second=1000,
+        duration_seconds=DURATION, ticks_per_second=1000,
         pipeline_specs=[
             PipelineSpec.query(weight=0.1),
             PipelineSpec.interactive(weight=0.3, num_ops_mean=8, num_ops_min=1,
@@ -198,7 +199,7 @@ def _bench_cpu_bound(seed: int) -> TraceConfig:
 def _bench_io_bound(seed: int) -> TraceConfig:
     """IO-heavy operator profiles. Stresses memory pressure and OOM recovery."""
     return TraceConfig(
-        duration_seconds=600, ticks_per_second=1000,
+        duration_seconds=DURATION, ticks_per_second=1000,
         pipeline_specs=[
             PipelineSpec.query(weight=0.1),
             PipelineSpec.interactive(weight=0.3, num_ops_mean=8, num_ops_min=1,
@@ -214,7 +215,7 @@ def _bench_io_bound(seed: int) -> TraceConfig:
 def _bench_deep_pipelines(seed: int) -> TraceConfig:
     """Long linear pipelines. Stresses dependency tracking over many sequential operators."""
     return TraceConfig(
-        duration_seconds=600, ticks_per_second=1000,
+        duration_seconds=DURATION, ticks_per_second=1000,
         pipeline_specs=[
             PipelineSpec.query(weight=0.1),
             PipelineSpec.interactive(weight=0.3, num_ops_mean=15, num_ops_min=10,
@@ -230,7 +231,7 @@ def _bench_deep_pipelines(seed: int) -> TraceConfig:
 def _bench_shallow_pipelines(seed: int) -> TraceConfig:
     """Very short pipelines. Stresses scheduling overhead and high job turnover."""
     return TraceConfig(
-        duration_seconds=600, ticks_per_second=1000,
+        duration_seconds=DURATION, ticks_per_second=1000,
         pipeline_specs=[
             PipelineSpec.query(weight=0.1),
             PipelineSpec.interactive(weight=0.3, num_ops_mean=2, num_ops_min=1, num_ops_max=3,
@@ -246,7 +247,7 @@ def _bench_shallow_pipelines(seed: int) -> TraceConfig:
 def _bench_dag_variety(seed: int) -> TraceConfig:
     """Pure fan-in / fan-out DAGs, no linear chains. Stresses parallel scheduling and join sync."""
     return TraceConfig(
-        duration_seconds=600, ticks_per_second=1000,
+        duration_seconds=DURATION, ticks_per_second=1000,
         pipeline_specs=[
             PipelineSpec.query(weight=0.1),
             PipelineSpec.interactive(weight=0.3, num_ops_mean=8, num_ops_min=3,
