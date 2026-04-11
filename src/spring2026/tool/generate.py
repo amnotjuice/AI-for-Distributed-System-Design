@@ -34,7 +34,7 @@ os.chdir(_SRC.parent)
 
 from llm import generate_policy, setup_cost_tracking, reset_cost_tracking, get_cost_statistics, get_last_request_cost
 from prompts import get_user_request_v2, get_user_request_v2_est
-from spring2026.tool.config import DEFAULT_MODEL, RESULTS_DIR, SCHEDULERS_DIR, SUPPORTED_EFFORTS
+from spring2026.tool.config import DEFAULT_MODEL, RESULTS_DIR, SCHEDULERS_DIR, SUPPORTED_EFFORTS, TWO_SHOT_PERF_CONDITIONS
 
 
 def generate_one_scheduler(
@@ -118,11 +118,14 @@ def _select_source_scheduler(source: str) -> tuple:
     assert analysis_path.exists(), (
         f"No results at {analysis_path}. Run: python analyze.py 01_reasoning"
     )
-    records = []
+    seen: dict[str, dict] = {}
     with open(analysis_path) as f:
         for line in f:
             if line.strip():
-                records.append(json.loads(line))
+                r = json.loads(line)
+                if fn := r.get("filename"):
+                    seen[fn] = r
+    records = list(seen.values())
 
     functional = [r for r in records if r.get("functional") and r.get("median_latency") is not None]
     assert functional, "No functional schedulers in 01_reasoning/low results"
@@ -150,6 +153,10 @@ def _get_rich_stats(scheduler_code: str, policy_key: str) -> list:
     from eudoxia.workload.runtime_status import ASSIGNABLE_STATES
     from spring2026.tool.config import TRACES_DIR, get_canonical_base_params
     from simulation_utils import get_raw_stats_for_policy
+
+    from eudoxia.scheduler.decorators import INIT_ALGOS, SCHEDULING_ALGOS
+    SCHEDULING_ALGOS.pop(policy_key, None)
+    INIT_ALGOS.pop(policy_key, None)
 
     exec(scheduler_code, {
         "__builtins__": __builtins__, "List": List, "Tuple": Tuple,
@@ -235,6 +242,152 @@ def generate_two_iter_scheduler(
     return output_path
 
 
+def _get_source_latency_cheap(source_code: str, policy_key: str, sim_overrides: dict) -> float:
+    """Run source on canonical_train with given sim overrides; return median adjusted_latency."""
+    from typing import List, Tuple
+    from eudoxia.executor.assignment import Assignment, ExecutionResult, Suspend
+    from eudoxia.scheduler.decorators import register_scheduler, register_scheduler_init
+    from eudoxia.utils import Priority
+    from eudoxia.workload import OperatorState, Pipeline
+    from eudoxia.workload.runtime_status import ASSIGNABLE_STATES
+    from spring2026.tool.config import TRACES_DIR, get_canonical_base_params
+    from simulation_utils import get_raw_stats_for_policy, extract_metrics_from_stats
+
+    from eudoxia.scheduler.decorators import INIT_ALGOS, SCHEDULING_ALGOS
+    SCHEDULING_ALGOS.pop(policy_key, None)
+    INIT_ALGOS.pop(policy_key, None)
+
+    exec(source_code, {
+        "__builtins__": __builtins__, "List": List, "Tuple": Tuple,
+        "Pipeline": Pipeline, "OperatorState": OperatorState,
+        "ASSIGNABLE_STATES": ASSIGNABLE_STATES, "Assignment": Assignment,
+        "ExecutionResult": ExecutionResult, "Suspend": Suspend,
+        "register_scheduler_init": register_scheduler_init,
+        "register_scheduler": register_scheduler, "Priority": Priority,
+    })
+
+    params = get_canonical_base_params()
+    params.update(sim_overrides)
+    canonical = str(TRACES_DIR / "bench_canonical_train.csv")
+    raw = []
+    for n_pools in [1, 2, 4, 8, 16]:
+        p = params.copy()
+        p["num_pools"] = n_pools
+        raw.extend(get_raw_stats_for_policy(p, [canonical], policy_key))
+
+    values = [float(v) for v in extract_metrics_from_stats(raw, "latency", base_params=params)]
+    finite = [v for v in values if v != float("inf")]
+    return _statistics.median(finite) if finite else float("inf")
+
+
+def generate_two_shot_perf_scheduler(
+    source_code: str,
+    cheap_latency: float,
+    sim_label: str,
+    policy_key: str,
+    output_dir: Path,
+    model: str,
+    verbose: bool,
+) -> Path | None:
+    """Generate one two-shot-perf scheduler using simple feedback from a cheap simulation."""
+    output_path = output_dir / f"{policy_key}.py"
+    if output_path.exists():
+        print(f"  {output_path.name} exists, skipping")
+        return output_path
+
+    feedback_text = (
+        f"This scheduler achieved a median weighted latency of {cheap_latency:.2f}s. "
+        f"Please improve it to reduce latency further."
+    )
+    feedback_history = [{"policy_code": source_code, "feedback": feedback_text}]
+
+    gen_start = time.time()
+    try:
+        result = generate_policy(
+            user_request=get_user_request_v2(policy_key),
+            feedback_history=feedback_history,
+            model=model,
+            temperature=1.0,
+            policy_key=policy_key,
+            verbose=verbose,
+            reasoning_effort_override="low",
+        )
+        code = result["policy_code"]
+        if not code or not code.strip():
+            _save_failure(output_dir, policy_key, "empty_code")
+            return None
+    except Exception as exc:
+        _save_failure(output_dir, policy_key, str(exc))
+        return None
+
+    cost = get_last_request_cost()
+    secs = time.time() - gen_start
+    header = "\n".join([
+        f"# policy_key: {policy_key}",
+        f"# sim_label: {sim_label}",
+        f"# model: {model}",
+        f"# llm_cost: {cost:.6f}",
+        f"# generation_seconds: {secs:.2f}",
+        f"# generated_at: {datetime.now().isoformat()}",
+        "",
+    ])
+    output_path.write_text(header + code + "\n")
+    print(f"  OK {output_path.name}  (${cost:.4f}, {secs:.1f}s)")
+    return output_path
+
+
+def _run_two_shot_perf(args) -> None:
+    """Generate schedulers for exp05: two-shot with varied sim fidelity."""
+    assert args.sim_label in TWO_SHOT_PERF_CONDITIONS, (
+        f"Unknown sim_label '{args.sim_label}'. Choices: {list(TWO_SHOT_PERF_CONDITIONS)}"
+    )
+    sim_overrides = TWO_SHOT_PERF_CONDITIONS[args.sim_label]
+
+    source_record, source_path = _select_source_scheduler("median")
+    source_code = source_path.read_text()
+    key_match = re.search(r"""@register_scheduler\((?:key=)?['"]([^'"]+)['"]\)""", source_code)
+    assert key_match, "No scheduler key in source code"
+
+    print(f"Source: {source_path.name}  sim_label={args.sim_label}")
+    print("Running source simulation for cheap latency...")
+    cheap_latency = _get_source_latency_cheap(source_code, key_match.group(1), sim_overrides)
+    print(f"  cheap_latency={cheap_latency:.4f}")
+
+    output_dir = SCHEDULERS_DIR / "two_shot_perf" / args.sim_label
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "meta.json").write_text(json.dumps({
+        "sim_label": args.sim_label,
+        "sim_overrides": sim_overrides,
+        "source_filename": source_path.name,
+        "source_cheap_latency": cheap_latency,
+        "model": args.model,
+        "n": args.n,
+    }, indent=2))
+
+    setup_cost_tracking()
+    reset_cost_tracking()
+
+    generated = []
+    for i in range(1, args.n + 1):
+        print(f"\n[{i}/{args.n}]")
+        p = generate_two_shot_perf_scheduler(
+            source_code=source_code,
+            cheap_latency=cheap_latency,
+            sim_label=args.sim_label,
+            policy_key=f"scheduler_perf_{args.sim_label}_{i:03d}",
+            output_dir=output_dir,
+            model=args.model,
+            verbose=args.verbose,
+        )
+        if p:
+            generated.append(p)
+
+    stats = get_cost_statistics()
+    print(f"\n{'='*50}")
+    print(f"DONE: {len(generated)}/{args.n} schedulers  |  cost=${stats['total_cost']:.4f}")
+    print(f"Output: {output_dir}")
+
+
 def _run_two_iter(args) -> None:
     """Run two-iteration scheduler generation."""
     source_record, source_path = _select_source_scheduler(args.source)
@@ -296,7 +449,8 @@ def main() -> None:
     assert os.environ.get("OPENAI_API_KEY"), "OPENAI_API_KEY not set"
 
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--exp", default="reasoning", choices=["reasoning", "estimation", "two_iter"],
+    parser.add_argument("--exp", default="reasoning",
+                        choices=["reasoning", "estimation", "two_iter", "two_shot_perf"],
                         help="Experiment type (default: reasoning)")
     parser.add_argument("--effort", default="low", choices=SUPPORTED_EFFORTS,
                         help="Reasoning effort level (default: low)")
@@ -308,10 +462,17 @@ def main() -> None:
                         help="Source scheduler for two_iter (default: best)")
     parser.add_argument("--context", default="simple", choices=["simple", "rich"],
                         help="Feedback context for two_iter (default: simple)")
+    # two_shot_perf only
+    parser.add_argument("--sim_label", default=None,
+                        help=f"Sim condition for two_shot_perf. Choices: {list(TWO_SHOT_PERF_CONDITIONS)}")
     args = parser.parse_args()
 
     if args.exp == "two_iter":
         _run_two_iter(args)
+        return
+
+    if args.exp == "two_shot_perf":
+        _run_two_shot_perf(args)
         return
 
     if args.exp == "estimation":

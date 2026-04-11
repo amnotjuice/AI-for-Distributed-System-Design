@@ -1,328 +1,353 @@
 # policy_key: scheduler_high_006
 # reasoning_effort: high
-# exp: reasoning
 # model: gpt-5.2-2025-12-11
-# llm_cost: 0.130771
-# generation_seconds: 176.84
-# generated_at: 2026-04-10T00:29:21.366544
+# llm_cost: 0.135144
+# generation_seconds: 164.96
+# generated_at: 2026-03-12T22:37:12.994350
 @register_scheduler_init(key="scheduler_high_006")
 def scheduler_high_006_init(s):
-    """Priority-aware, OOM-robust, headroom-preserving scheduler.
+    """Priority-aware, reservation-based scheduler (incremental improvement over naive FIFO).
 
-    Core ideas:
-      1) Prioritize QUERY > INTERACTIVE > BATCH via weighted round-robin (10/5/1) to reduce weighted latency.
-      2) Avoid costly failures by tracking per-operator RAM needs and doubling RAM on OOM (fast convergence).
-      3) Preserve headroom for high-priority work by preventing batch from consuming the last chunk of CPU/RAM
-         whenever there is outstanding high-priority demand.
-      4) Fill each pool with multiple assignments per tick (instead of 1) to improve utilization/throughput.
+    Main ideas (kept intentionally simple / "small improvements first"):
+      1) Priority queues: QUERY > INTERACTIVE > BATCH.
+      2) Headroom reservation: prevent BATCH from consuming all resources so new high-priority work
+         can start immediately (improves p95/p99 latency without needing preemption visibility).
+      3) Better packing than naive: allow multiple assignments per tick across pools while tracking
+         remaining pool headroom in local scratch variables.
+      4) OOM-aware RAM retry: if an operator fails with an OOM-like error, remember it and increase
+         its RAM hint on subsequent retries (instead of dropping failed pipelines).
+
+    Notes:
+      - Does not use preemption (Suspend) because we typically don't have visibility into running
+        containers beyond completion/failure results.
+      - Schedules at most one operator per pipeline per tick to reduce bursty over-parallelization.
     """
-    # Global tick for simple aging/housekeeping
-    s._tick = 0
+    from collections import deque
 
-    # Per-priority FIFO queues of Pipeline objects
-    s._queues = {
-        Priority.QUERY: [],
-        Priority.INTERACTIVE: [],
-        Priority.BATCH_PIPELINE: [],
-    }
+    # Separate FIFO queues per priority for strict ordering.
+    s.q_query = deque()
+    s.q_interactive = deque()
+    s.q_batch = deque()
 
-    # Track active pipelines and arrivals (mainly for bookkeeping / future extensions)
-    s._active = {}          # pipeline_id -> Pipeline
-    s._arrival_tick = {}    # pipeline_id -> tick
+    # "Clock" for simple aging / bookkeeping.
+    s.tick = 0
 
-    # Per-operator learned resource hints (keyed by id(op) to avoid assumptions about op schema)
-    s._op_ram_est = {}      # op_id -> ram_estimate
-    s._op_retries = {}      # op_id -> retry_count
-    s._op_to_pipeline = {}  # op_id -> pipeline_id (learned when we first see the op as runnable)
+    # Pipeline metadata: arrival tick, etc.
+    s.pipeline_meta = {}  # pipeline_id -> {"arrival_tick": int}
 
-    # Give-up set for operators that appear unschedulable (e.g., OOM even at near-max RAM repeatedly)
-    # Note: We keep this conservative for high-priority ops to avoid dropping them.
-    s._op_giveup = set()
+    # Operator-level RAM hints learned from OOM failures.
+    # Keyed by Python object identity (id(op)), which is stable inside this simulator.
+    s.op_ram_hint = {}  # id(op) -> ram_target
+    s.op_oom_retries = {}  # id(op) -> int
 
-    # Weighted RR order (QUERY dominates score, then INTERACTIVE, then BATCH)
-    s._rr_seq = ([Priority.QUERY] * 10) + ([Priority.INTERACTIVE] * 5) + ([Priority.BATCH_PIPELINE] * 1)
-    s._rr_idx = 0
+    # Map operator object id back to pipeline_id (so we can attribute failures).
+    s.op_to_pipeline = {}  # id(op) -> pipeline_id
 
-    # Limit how many new containers we start per pool per tick to reduce churn
-    s._max_assignments_per_pool = 4
+    # Pipelines with "non-OOM" failures (we stop retrying to avoid infinite loops).
+    s.pipeline_permanent_fail = set()
 
-    # Cache overall maxima to detect impossible RAM fits
-    try:
-        s._max_ram_overall = max(p.max_ram_pool for p in s.executor.pools)
-        s._max_cpu_overall = max(p.max_cpu_pool for p in s.executor.pools)
-    except Exception:
-        # Safe fallback (should not happen in normal simulator wiring)
-        s._max_ram_overall = 0
-        s._max_cpu_overall = 0
+    # Reservation fractions (protect latency by leaving some resources unused for sudden arrivals).
+    # Applied only when placing BATCH work.
+    s.reserve_cpu_frac_pool0 = 0.50
+    s.reserve_ram_frac_pool0 = 0.50
+    s.reserve_cpu_frac_other = 0.25
+    s.reserve_ram_frac_other = 0.25
 
+    # Simple aging: if a batch pipeline waits too long, treat it like INTERACTIVE for admission.
+    s.aging_threshold_ticks = 50
 
-def _sched_high_006_assignable_states():
-    # Be robust if the simulator exposes ASSIGNABLE_STATES globally (as in the template),
-    # otherwise derive it from OperatorState.
-    states = globals().get("ASSIGNABLE_STATES")
-    if states is not None:
-        return states
-    return [OperatorState.PENDING, OperatorState.FAILED]
-
-
-def _sched_high_006_is_oom(error_obj) -> bool:
-    if not error_obj:
-        return False
-    msg = str(error_obj).lower()
-    return ("oom" in msg) or ("out of memory" in msg) or ("cuda out of memory" in msg) or ("cannot allocate memory" in msg)
-
-
-def _sched_high_006_next_prio(s):
-    pr = s._rr_seq[s._rr_idx]
-    s._rr_idx = (s._rr_idx + 1) % len(s._rr_seq)
-    return pr
-
-
-def _sched_high_006_base_ram_frac(priority):
-    # Slightly conservative to reduce OOM churn (OOMs inflate end-to-end latency and risk 720s penalty).
-    if priority == Priority.QUERY:
-        return 0.30
-    if priority == Priority.INTERACTIVE:
-        return 0.25
-    return 0.20  # batch
-
-
-def _sched_high_006_base_cpu_request(priority, pool):
-    # CPU has sublinear scaling; cap per-op CPU to allow concurrency but still keep high priority fast.
-    max_cpu = float(pool.max_cpu_pool)
-    if priority == Priority.QUERY:
-        # Prefer more CPU to reduce tail latency; still capped.
-        return max(2.0, min(8.0, 0.60 * max_cpu))
-    if priority == Priority.INTERACTIVE:
-        return max(1.0, min(6.0, 0.45 * max_cpu))
-    return max(1.0, min(4.0, 0.30 * max_cpu))
-
-
-def _sched_high_006_request_ram(s, op_id, priority, pool, avail_ram):
-    max_ram = float(pool.max_ram_pool)
-    # Learned estimate wins; otherwise a conservative base fraction of pool RAM.
-    est = s._op_ram_est.get(op_id)
-    if est is None or est <= 0:
-        est = _sched_high_006_base_ram_frac(priority) * max_ram
-    # Never request >90% of pool RAM by default (keeps some slack for variability / other work).
-    req = min(est, 0.90 * max_ram)
-    # Must fit what is currently available.
-    return min(float(avail_ram), float(req))
-
-
-def _sched_high_006_request_cpu(priority, pool, avail_cpu):
-    req = _sched_high_006_base_cpu_request(priority, pool)
-    return min(float(avail_cpu), float(req))
-
-
-def _sched_high_006_has_high_pressure(s) -> bool:
-    # Cheap approximation: if there exist non-empty high-priority queues, assume pressure.
-    # (We avoid scanning full DAG readiness to keep policy simple and fast.)
-    return (len(s._queues[Priority.QUERY]) > 0) or (len(s._queues[Priority.INTERACTIVE]) > 0)
-
-
-def _sched_high_006_find_fit(s, priority, pool, avail_cpu, avail_ram, high_pressure, reserve_cpu, reserve_ram):
-    """Scan the priority queue once to find a runnable op that fits current resources.
-
-    Returns: (pipeline, ops, cpu, ram) or None
-    """
-    q = s._queues[priority]
-    if not q:
-        return None
-
-    assignable_states = _sched_high_006_assignable_states()
-    n = len(q)
-
-    for _ in range(n):
-        pipeline = q.pop(0)
-        pid = pipeline.pipeline_id
-
-        status = pipeline.runtime_status()
-        if status.is_pipeline_successful():
-            # Drop completed pipelines from active tracking; do not requeue.
-            s._active.pop(pid, None)
-            s._arrival_tick.pop(pid, None)
-            continue
-
-        # Only schedule ops whose parents are complete to respect DAG dependencies.
-        ops = status.get_ops(assignable_states, require_parents_complete=True)[:1]
-        if not ops:
-            # Not runnable yet; keep it in rotation.
-            q.append(pipeline)
-            continue
-
-        op = ops[0]
-        op_id = id(op)
-        s._op_to_pipeline.setdefault(op_id, pid)
-
-        # If we've concluded this operator is not feasible, skip it (prevents endless OOM thrash).
-        if op_id in s._op_giveup:
-            q.append(pipeline)
-            continue
-
-        cpu_req = _sched_high_006_request_cpu(priority, pool, avail_cpu)
-        ram_req = _sched_high_006_request_ram(s, op_id, priority, pool, avail_ram)
-
-        # Must be positive to make progress
-        if cpu_req <= 0 or ram_req <= 0:
-            q.append(pipeline)
-            continue
-
-        # Headroom protection: if high pressure exists, don't let batch consume the last chunk.
-        if priority == Priority.BATCH_PIPELINE and high_pressure:
-            if (float(avail_cpu) - float(cpu_req)) < float(reserve_cpu) or (float(avail_ram) - float(ram_req)) < float(reserve_ram):
-                # Put it back and allow higher priorities to take resources.
-                q.append(pipeline)
-                return None
-
-        # Check fit
-        if float(cpu_req) <= float(avail_cpu) and float(ram_req) <= float(avail_ram):
-            # Requeue pipeline to allow round-robin across pipelines of same priority.
-            q.append(pipeline)
-            return pipeline, ops, cpu_req, ram_req
-
-        # Doesn't fit; keep it in queue and continue scanning for a smaller one.
-        q.append(pipeline)
-
-    return None
+    # Limits to avoid thrashing on repeated OOMs.
+    s.max_oom_retries_per_op = 4
 
 
 @register_scheduler(key="scheduler_high_006")
-def scheduler_high_006_scheduler(s, results: List["ExecutionResult"], pipelines: List["Pipeline"]) -> Tuple[List["Suspend"], List["Assignment"]]:
-    """Scheduling step.
-
-    - Ingest new pipelines
-    - Learn from execution results (especially OOM backoff)
-    - Place runnable ops onto pools using weighted priority RR + batch headroom gating
+def scheduler_high_006_scheduler(s, results, pipelines):
     """
-    s._tick += 1
+    Priority-aware scheduler with headroom reservation and OOM-informed RAM sizing.
 
-    # Learn from results (focus: reduce failures by converging on sufficient RAM quickly).
+    Returns:
+        (suspensions, assignments)
+    """
+    s.tick += 1
+
+    def _is_oom_error(err):
+        if err is None:
+            return False
+        msg = str(err).lower()
+        return ("oom" in msg) or ("out of memory" in msg) or ("memoryerror" in msg)
+
+    def _queue_for_priority(pri):
+        if pri == Priority.QUERY:
+            return s.q_query
+        if pri == Priority.INTERACTIVE:
+            return s.q_interactive
+        return s.q_batch
+
+    def _ensure_pipeline_meta(p):
+        if p.pipeline_id not in s.pipeline_meta:
+            s.pipeline_meta[p.pipeline_id] = {"arrival_tick": s.tick}
+
+    def _is_aged_batch(p):
+        if p.priority != Priority.BATCH_PIPELINE:
+            return False
+        meta = s.pipeline_meta.get(p.pipeline_id)
+        if not meta:
+            return False
+        return (s.tick - meta["arrival_tick"]) >= s.aging_threshold_ticks
+
+    def _default_ram_frac(pri):
+        # Conservative for latency (more RAM reduces OOM risk); batch gets less by default.
+        if pri == Priority.QUERY:
+            return 0.50
+        if pri == Priority.INTERACTIVE:
+            return 0.40
+        return 0.25
+
+    def _default_cpu_frac(pri):
+        # Give more CPU to high-priority work to reduce response time.
+        if pri == Priority.QUERY:
+            return 0.75
+        if pri == Priority.INTERACTIVE:
+            return 0.50
+        return 0.25
+
+    def _reserve_fracs(pool_id):
+        if pool_id == 0:
+            return s.reserve_cpu_frac_pool0, s.reserve_ram_frac_pool0
+        return s.reserve_cpu_frac_other, s.reserve_ram_frac_other
+
+    def _pick_runnable_pipeline(q, scheduled_pipeline_ids, only_aged_batch=False):
+        """Pop/rotate within a queue to find a runnable pipeline with a ready operator."""
+        n = len(q)
+        for _ in range(n):
+            p = q.popleft()
+            _ensure_pipeline_meta(p)
+
+            # Avoid scheduling multiple ops from same pipeline in a single tick.
+            if p.pipeline_id in scheduled_pipeline_ids:
+                q.append(p)
+                continue
+
+            # Skip permanently failed pipelines.
+            if p.pipeline_id in s.pipeline_permanent_fail:
+                continue
+
+            status = p.runtime_status()
+            if status.is_pipeline_successful():
+                continue
+
+            if only_aged_batch and (not _is_aged_batch(p)):
+                q.append(p)
+                continue
+
+            op_list = status.get_ops(ASSIGNABLE_STATES, require_parents_complete=True)[:1]
+            if not op_list:
+                # Not runnable now; keep it in the queue.
+                q.append(p)
+                continue
+
+            # Found a runnable pipeline and an op to schedule.
+            q.append(p)
+            return p, op_list
+
+        return None, None
+
+    def _pool_order(avail_cpu, avail_ram):
+        # Prefer pools with more headroom.
+        return sorted(
+            range(s.executor.num_pools),
+            key=lambda i: (avail_cpu[i] + 1e-9) * (avail_ram[i] + 1e-9),
+            reverse=True,
+        )
+
+    def _compute_allocations(pool_id, pri, op_obj, avail_cpu, avail_ram, max_cpu, max_ram, enforce_batch_reserve):
+        """Decide cpu/ram for the container that will run op_obj in pool_id."""
+        op_id = id(op_obj)
+
+        # Base targets from pool size and priority.
+        base_cpu = max_cpu * _default_cpu_frac(pri)
+        base_ram = max_ram * _default_ram_frac(pri)
+
+        # Apply learned RAM hint (only increases due to OOM).
+        hinted_ram = s.op_ram_hint.get(op_id)
+        if hinted_ram is not None:
+            base_ram = max(base_ram, hinted_ram)
+
+        # Clip to what's available (and reasonable).
+        # Keep at least a tiny positive allocation to avoid zeros.
+        cpu = max(0.001, min(avail_cpu, base_cpu))
+        ram = max(0.001, min(avail_ram, base_ram))
+
+        if enforce_batch_reserve:
+            reserve_cpu_frac, reserve_ram_frac = _reserve_fracs(pool_id)
+            reserve_cpu = max_cpu * reserve_cpu_frac
+            reserve_ram = max_ram * reserve_ram_frac
+
+            # Ensure we do not eat into reserved headroom.
+            usable_cpu = max(0.0, avail_cpu - reserve_cpu)
+            usable_ram = max(0.0, avail_ram - reserve_ram)
+
+            # If there's no usable headroom, do not schedule batch here.
+            if usable_cpu <= 0.0 or usable_ram <= 0.0:
+                return None, None
+
+            cpu = max(0.001, min(cpu, usable_cpu))
+            ram = max(0.001, min(ram, usable_ram))
+
+            # Still must fit.
+            if cpu <= 0.0 or ram <= 0.0:
+                return None, None
+
+        # Avoid extremely tiny batch allocations that would increase latency without improving throughput.
+        # (Keep this mild to avoid accidental "can't schedule" states.)
+        if pri == Priority.BATCH_PIPELINE:
+            cpu = max(cpu, min(avail_cpu, max_cpu * 0.10))
+            ram = max(ram, min(avail_ram, max_ram * 0.10))
+
+        return cpu, ram
+
+    # Enqueue new pipelines into their priority queues.
+    for p in pipelines:
+        _ensure_pipeline_meta(p)
+        _queue_for_priority(p.priority).append(p)
+
+    # Learn from results (mainly: OOM -> bump RAM hint; non-OOM -> mark pipeline as permanent fail).
     for r in results:
         if not getattr(r, "ops", None):
             continue
 
-        pool_id = getattr(r, "pool_id", None)
-        pool = s.executor.pools[pool_id] if pool_id is not None and 0 <= pool_id < s.executor.num_pools else None
-        max_ram_pool = float(pool.max_ram_pool) if pool is not None else float(s._max_ram_overall or 0)
+        failed = False
+        try:
+            failed = r.failed()
+        except Exception:
+            failed = bool(getattr(r, "error", None))
 
+        if not failed:
+            continue
+
+        is_oom = _is_oom_error(getattr(r, "error", None))
+
+        # Attribute the failure to the pipeline via the operator identity mapping.
+        # If multiple ops are present, update all of them (safe, conservative).
         for op in r.ops:
             op_id = id(op)
+            pid = s.op_to_pipeline.get(op_id)
 
-            # Record mapping if we saw the op only via results (best-effort).
-            if op_id not in s._op_to_pipeline:
-                # Can't infer pipeline_id from results reliably; leave unset.
-                pass
+            if is_oom:
+                retries = s.op_oom_retries.get(op_id, 0) + 1
+                s.op_oom_retries[op_id] = retries
 
-            if r.failed():
-                s._op_retries[op_id] = s._op_retries.get(op_id, 0) + 1
-
-                if _sched_high_006_is_oom(getattr(r, "error", None)):
-                    # Double RAM on OOM, capped by overall/pool max.
-                    prev = s._op_ram_est.get(op_id, float(getattr(r, "ram", 0)) or 0.0)
-                    allocated = float(getattr(r, "ram", 0) or 0.0)
-                    base = max(prev, allocated, 1.0)
-                    new_est = base * 2.0
-                    cap = max_ram_pool if max_ram_pool > 0 else float(s._max_ram_overall or new_est)
-                    s._op_ram_est[op_id] = min(new_est, cap)
-
-                    # If we keep OOM-ing near max RAM, eventually stop retrying batch ops to avoid wasting time.
-                    # For high-priority ops we keep retrying longer (since they dominate the score).
-                    near_max = (cap > 0) and (s._op_ram_est.get(op_id, 0.0) >= 0.95 * cap)
-                    if near_max:
-                        max_retry = 8 if r.priority in (Priority.QUERY, Priority.INTERACTIVE) else 4
-                        if s._op_retries.get(op_id, 0) >= max_retry:
-                            s._op_giveup.add(op_id)
-            else:
-                # On success, we can seed RAM estimate (useful for retries / similar future attempts in the same run).
-                ram_used = float(getattr(r, "ram", 0) or 0.0)
-                if ram_used > 0:
-                    prev = s._op_ram_est.get(op_id)
-                    if prev is None or prev <= 0:
-                        s._op_ram_est[op_id] = ram_used
-                    else:
-                        # Very light smoothing (avoid oscillations if allocations vary by pool).
-                        s._op_ram_est[op_id] = 0.85 * float(prev) + 0.15 * ram_used
-
-    # Ingest new pipelines
-    for p in pipelines:
-        pid = p.pipeline_id
-        if pid in s._active:
-            continue
-        s._active[pid] = p
-        s._arrival_tick[pid] = s._tick
-        # Ensure priority key exists even if new enum value appears (fallback to batch queue).
-        pr = getattr(p, "priority", Priority.BATCH_PIPELINE)
-        if pr not in s._queues:
-            pr = Priority.BATCH_PIPELINE
-        s._queues[pr].append(p)
-
-    # Early exit if nothing changed
-    if not pipelines and not results:
-        return [], []
-
-    suspensions: List["Suspend"] = []
-    assignments: List["Assignment"] = []
-
-    # Global high-pressure signal to preserve some headroom against batch (no preemption in this policy).
-    high_pressure = _sched_high_006_has_high_pressure(s)
-
-    # Schedule across pools (pack multiple ops per pool per tick).
-    for pool_id in range(s.executor.num_pools):
-        pool = s.executor.pools[pool_id]
-        avail_cpu = float(pool.avail_cpu_pool)
-        avail_ram = float(pool.avail_ram_pool)
-
-        if avail_cpu <= 0 or avail_ram <= 0:
-            continue
-
-        # Reserve headroom for high priority arrivals/backlog (prevents batch from blocking query/interactive).
-        reserve_cpu = max(1.0, 0.25 * float(pool.max_cpu_pool)) if high_pressure else 0.0
-        reserve_ram = max(0.0, 0.25 * float(pool.max_ram_pool)) if high_pressure else 0.0
-
-        started = 0
-        # Try to start multiple containers to improve throughput/utilization.
-        while started < s._max_assignments_per_pool and avail_cpu > 0 and avail_ram > 0:
-            made_progress = False
-
-            # Weighted RR across priorities (10/5/1), skip empties / non-fitting candidates.
-            for _ in range(len(s._rr_seq)):
-                prio = _sched_high_006_next_prio(s)
-                fit = _sched_high_006_find_fit(
-                    s=s,
-                    priority=prio,
-                    pool=pool,
-                    avail_cpu=avail_cpu,
-                    avail_ram=avail_ram,
-                    high_pressure=high_pressure,
-                    reserve_cpu=reserve_cpu,
-                    reserve_ram=reserve_ram,
-                )
-                if fit is None:
+                # If we keep OOMing, eventually stop retrying this pipeline to avoid infinite loops.
+                if pid is not None and retries > s.max_oom_retries_per_op:
+                    s.pipeline_permanent_fail.add(pid)
                     continue
 
-                pipeline, ops, cpu_req, ram_req = fit
+                # Increase RAM hint aggressively for the next attempt.
+                # Prefer doubling last attempted RAM; cap at pool max RAM for the pool where it failed.
+                pool_id = getattr(r, "pool_id", None)
+                if pool_id is None:
+                    # Fallback: just multiply the existing hint if present.
+                    prev = s.op_ram_hint.get(op_id, max(0.001, getattr(r, "ram", 0.001)))
+                    s.op_ram_hint[op_id] = prev * 2.0
+                else:
+                    max_ram = s.executor.pools[pool_id].max_ram_pool
+                    attempted = max(0.001, getattr(r, "ram", 0.001))
+                    new_hint = min(max_ram, attempted * 2.0)
+                    prev_hint = s.op_ram_hint.get(op_id, 0.0)
+                    s.op_ram_hint[op_id] = max(prev_hint, new_hint)
+            else:
+                # Non-OOM failures are treated as permanent (do not spin on FAILED ops).
+                if pid is not None:
+                    s.pipeline_permanent_fail.add(pid)
 
-                # Create the assignment
+    # If no new info, we can still try to schedule (priority headroom matters even without arrivals).
+    suspensions = []
+    assignments = []
+
+    # Snapshot available resources (we will deduct locally as we place multiple assignments).
+    num_pools = s.executor.num_pools
+    avail_cpu = [s.executor.pools[i].avail_cpu_pool for i in range(num_pools)]
+    avail_ram = [s.executor.pools[i].avail_ram_pool for i in range(num_pools)]
+    max_cpu = [s.executor.pools[i].max_cpu_pool for i in range(num_pools)]
+    max_ram = [s.executor.pools[i].max_ram_pool for i in range(num_pools)]
+
+    scheduled_pipeline_ids = set()
+
+    def _try_schedule_from_queue(pri, q, allow_aged_batch=False, only_aged_batch=False):
+        """Greedily place runnable ops from a queue onto pools with most headroom."""
+        nonlocal assignments, avail_cpu, avail_ram
+
+        # Keep attempting while there is runnable work and some pool has headroom.
+        for _ in range(len(q) + 32):  # small bound to avoid pathological loops
+            if all((avail_cpu[i] <= 0.0 or avail_ram[i] <= 0.0) for i in range(num_pools)):
+                return
+
+            p, op_list = _pick_runnable_pipeline(
+                q,
+                scheduled_pipeline_ids,
+                only_aged_batch=only_aged_batch
+            )
+            if p is None or not op_list:
+                return
+
+            op = op_list[0]
+            op_id = id(op)
+            s.op_to_pipeline[op_id] = p.pipeline_id
+
+            # Choose a pool (prefer high headroom). For BATCH, enforce reservation.
+            pool_candidates = _pool_order(avail_cpu, avail_ram)
+            placed = False
+            for pool_id in pool_candidates:
+                if avail_cpu[pool_id] <= 0.0 or avail_ram[pool_id] <= 0.0:
+                    continue
+
+                enforce_reserve = (pri == Priority.BATCH_PIPELINE)
+                cpu, ram = _compute_allocations(
+                    pool_id=pool_id,
+                    pri=pri,
+                    op_obj=op,
+                    avail_cpu=avail_cpu[pool_id],
+                    avail_ram=avail_ram[pool_id],
+                    max_cpu=max_cpu[pool_id],
+                    max_ram=max_ram[pool_id],
+                    enforce_batch_reserve=enforce_reserve
+                )
+                if cpu is None or ram is None:
+                    continue
+
+                # Place it.
                 assignments.append(
                     Assignment(
-                        ops=ops,
-                        cpu=float(cpu_req),
-                        ram=float(ram_req),
-                        priority=pipeline.priority,
+                        ops=[op],
+                        cpu=cpu,
+                        ram=ram,
+                        priority=p.priority,
                         pool_id=pool_id,
-                        pipeline_id=pipeline.pipeline_id,
+                        pipeline_id=p.pipeline_id
                     )
                 )
-
-                # Update local available resources and continue packing.
-                avail_cpu -= float(cpu_req)
-                avail_ram -= float(ram_req)
-                started += 1
-                made_progress = True
+                avail_cpu[pool_id] -= cpu
+                avail_ram[pool_id] -= ram
+                scheduled_pipeline_ids.add(p.pipeline_id)
+                placed = True
                 break
 
-            if not made_progress:
-                break
+            if not placed:
+                # Couldn't place this runnable op anywhere right now; stop for this queue.
+                return
+
+    # 1) QUERY first (lowest latency target).
+    _try_schedule_from_queue(Priority.QUERY, s.q_query)
+
+    # 2) INTERACTIVE next.
+    _try_schedule_from_queue(Priority.INTERACTIVE, s.q_interactive)
+
+    # 2b) Aged BATCH: if a batch job has waited long, allow it to compete earlier to reduce starvation.
+    # We still *admit it in this phase*, but keep BATCH reservation rules when it runs in the BATCH phase.
+    # Here, we let a few aged batch pipelines start earlier (helps tail latency fairness).
+    _try_schedule_from_queue(Priority.INTERACTIVE, s.q_batch, only_aged_batch=True)
+
+    # 3) BATCH last, with reservation to protect future QUERY/INTERACTIVE arrivals.
+    _try_schedule_from_queue(Priority.BATCH_PIPELINE, s.q_batch)
 
     return suspensions, assignments

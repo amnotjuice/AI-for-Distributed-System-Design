@@ -22,7 +22,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "chz", specifier = ">=0.4.0" },
-    { name = "eudoxia", git = "https://github.com/BauplanLabs/eudoxia?rev=84214231b0c4c244c04bbda79d236b954abd1a91" },
+    { name = "eudoxia", git = "https://github.com/BauplanLabs/eudoxia?rev=c62122cd15eca36d8872f7f9204d2f9c30774b28" },
     { name = "litellm", specifier = ">=1.77.5" },
     { name = "pandas", specifier = ">=2.0.0" },
     { name = "plotly", specifier = ">=5.18.0" },
@@ -346,12 +346,13 @@ wheels = [
 [[package]]
 name = "eudoxia"
 version = "0.0"
-source = { git = "https://github.com/BauplanLabs/eudoxia?rev=84214231b0c4c244c04bbda79d236b954abd1a91#84214231b0c4c244c04bbda79d236b954abd1a91" }
+source = { git = "https://github.com/BauplanLabs/eudoxia?rev=c62122cd15eca36d8872f7f9204d2f9c30774b28#c62122cd15eca36d8872f7f9204d2f9c30774b28" }
 dependencies = [
     { name = "matplotlib" },
     { name = "numpy" },
     { name = "pandas" },
     { name = "pytest" },
+    { name = "requests" },
     { name = "tomlkit" },
 ]
 
