@@ -24,7 +24,7 @@ import statistics
 import subprocess
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from contextlib import suppress
 from pathlib import Path
 
@@ -33,6 +33,7 @@ _SRC = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(_SRC))
 os.environ.setdefault("LITELLM_LOG", "ERROR")
 logging.getLogger("eudoxia").setLevel(logging.CRITICAL)
+logging.getLogger("simulation_utils").setLevel(logging.ERROR)
 
 from spring2026.tool.config import (
     ESTIMATOR_CONDITIONS,
@@ -416,16 +417,45 @@ def _run_probes_for_dir(sched_dir: Path, out_dir: Path, base_params: dict, worke
     """Run all probes on schedulers in sched_dir, write CSV to out_dir/probes.csv."""
     _probe_dir = Path(__file__).resolve().parent / "probe"
     sys.path.insert(0, str(_probe_dir))
-    from run_probes import ensure_traces, run_probes_parallel, write_csv
+    from run_probes import ensure_traces, run_all_probes, _worker, write_csv
 
     traces = ensure_traces()
     scheduler_files = sorted(sched_dir.glob("scheduler_*.py"))
     if not scheduler_files:
         return
-    all_results = run_probes_parallel(scheduler_files, base_params, traces, workers=workers)
-    for sf, results in zip(scheduler_files, all_results):
-        passed = sum(1 for r in results.values() if r.get("functional"))
-        print(f"  {sf.name}: {passed}/{len(results)}")
+
+    n = len(scheduler_files)
+    results_by_file: dict[Path, dict] = {}
+
+    if workers <= 1:
+        for i, sf in enumerate(scheduler_files, 1):
+            results = run_all_probes(sf, base_params, traces)
+            passed = sum(1 for r in results.values() if r.get("functional"))
+            print(f"  [{i}/{n}] {sf.name}: {passed}/{len(results)}")
+            results_by_file[sf] = results
+    else:
+        import multiprocessing as _mp
+        probe_timeout = base_params.get("subprocess_timeout", 120)
+        pool = _mp.Pool(processes=workers)
+        async_results = [(sf, pool.apply_async(_worker, ((sf, base_params, traces),)))
+                         for sf in scheduler_files]
+        pool.close()
+        for i, (sf, ar) in enumerate(async_results, 1):
+            try:
+                _, results = ar.get(timeout=probe_timeout)
+            except _mp.TimeoutError:
+                results = {"_probe": {"functional": False, "failure_mode": "timeout"}}
+                print(f"  [{i}/{n}] {sf.name}: TIMEOUT after {probe_timeout}s")
+            except Exception as e:
+                results = {"_probe": {"functional": False, "failure_mode": "probe_error",
+                                      "error_message": str(e)}}
+            results_by_file[sf] = results
+            passed = sum(1 for r in results.values() if r.get("functional"))
+            print(f"  [{i}/{n}] {sf.name}: {passed}/{len(results)}")
+        pool.terminate()
+        pool.join()
+
+    all_results = [results_by_file[sf] for sf in scheduler_files]
     write_csv(scheduler_files, all_results, out_dir / "probes.csv")
 
 
@@ -446,7 +476,9 @@ def analyze_01_reasoning(prototype: bool, workers: int = 1, phase: str = "all") 
 
         if phase in ("all", "probe"):
             print(f"\n--- Probes: {effort} ---")
-            _run_probes_for_dir(sched_dir, out_dir, base_params, workers=workers)
+            probe_params = base_params.copy()
+            probe_params["duration"] = 120
+            _run_probes_for_dir(sched_dir, out_dir, probe_params, workers=workers)
 
         if phase in ("all", "latency"):
             print(f"\n--- Latency: {effort} ---")
@@ -471,7 +503,9 @@ def analyze_02_estimation(prototype: bool, workers: int = 1, phase: str = "all")
         # Run probes once for the estimation schedulers
         out_base = RESULTS_DIR / "02_estimation"
         print("\n--- Probes: estimation ---")
-        _run_probes_for_dir(sched_dir, out_base, base_params, workers=workers)
+        probe_params = base_params.copy()
+        probe_params["duration"] = 120
+        _run_probes_for_dir(sched_dir, out_base, probe_params, workers=workers)
 
     if phase in ("all", "latency"):
         # Evaluate under each sigma condition
@@ -858,8 +892,10 @@ def analyze_06_multi_iter(prototype: bool, dry_run: bool = False) -> None:
     for old in out_dir.glob("iterations*.csv"):
         old.unlink()
 
-    with (Path(__file__).resolve().parent / "scenarios.csv").open() as f:
-        scenarios = list(_csv.DictReader(f))[:n_scenarios]
+    with (SPRING2026_DIR / "scenarios" / "scenarios.csv").open() as f:
+        _all = list(_csv.DictReader(f))
+    _stride = max(1, len(_all) // n_scenarios)
+    scenarios = _all[::_stride][:n_scenarios]
 
     if not dry_run:
         seed_files = sorted((SCHEDULERS_DIR / "reasoning" / "low").glob("scheduler_*.py"))
@@ -871,7 +907,8 @@ def analyze_06_multi_iter(prototype: bool, dry_run: bool = False) -> None:
 
         for s_idx, scenario in enumerate(scenarios):
             scenario_id = f"scenario_{s_idx:02d}"
-            print(f"\n--- {scenario_id}: {Path(scenario['trace']).name} ---")
+            objective = scenario.get("objective", "")
+            print(f"\n--- {scenario_id}: {Path(scenario['train_trace']).name} ---")
             sched_dir = SCHEDULERS_DIR / "multi_iter" / scenario_id
             sched_dir.mkdir(parents=True, exist_ok=True)
 
@@ -882,15 +919,11 @@ def analyze_06_multi_iter(prototype: bool, dry_run: bool = False) -> None:
             else:
                 iter_0.write_text(seed_files[0].read_text())  # type: ignore[possibly-undefined]
 
-            toml_path = SPRING2026_DIR / scenario["params"]
+            base_params = get_canonical_base_params(prototype=prototype)
+            toml_path = (SPRING2026_DIR / "scenarios" / scenario["params"]).resolve()
             with toml_path.open("rb") as f:
-                base_params = tomllib.load(f)
-            base_params.setdefault("per_trace_timeout", None)
-            base_params.setdefault("subprocess_timeout", None)
-            base_params.setdefault("estimator_algo", None)
-            if prototype:
-                base_params.update(PROTOTYPE_OVERRIDES)
-            trace_file = str(SPRING2026_DIR / scenario["trace"])
+                base_params.update(tomllib.load(f))
+            trace_file = str((SPRING2026_DIR / "scenarios" / scenario["train_trace"]).resolve())
 
             for it in range(n_iterations):
                 iter_path = sched_dir / f"iter_{it:03d}.py"
@@ -932,19 +965,387 @@ def analyze_06_multi_iter(prototype: bool, dry_run: bool = False) -> None:
     print(f"\nOutput: {csv_path}")
 
 
-def analyze_07_cross_eval(prototype: bool) -> None:
-    """Fig 7: cross-eval heatmap."""
-    print("analyze_07: not yet implemented")
+def _cross_eval_geomean_worker(args: tuple) -> tuple[str, str, float]:
+    """Module-level worker: evaluate one scheduler across scales on one scenario, return geomean."""
+    import math
+    scheduler_scenario, eval_scenario, sched_path, trace_file, params, scales = args
+    worker_script = Path(__file__).resolve().parent / "_one_iteration_worker.py"
+    project_root = Path(__file__).resolve().parent.parent.parent.parent
+
+    latencies = []
+    for scale in scales:
+        p = params.copy()
+        p["cpus_per_pool"] = params["cpus_per_pool"] * scale
+        p["ram_gb_per_pool"] = params["ram_gb_per_pool"] * scale
+        cmd = [sys.executable, str(worker_script), sched_path, trace_file, json.dumps(p)]
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True,
+                cwd=str(project_root),
+                timeout=p.get("subprocess_timeout", 120),
+            )
+            for line in reversed(proc.stdout.strip().split("\n")):
+                if line.startswith("__RESULT__"):
+                    result = json.loads(line[len("__RESULT__"):])
+                    if result.get("ok"):
+                        latencies.append(result["latency"])
+                    break
+        except Exception:
+            pass
+
+    if latencies:
+        gm = math.exp(sum(math.log(max(v, 1e-12)) for v in latencies) / len(latencies))
+    else:
+        gm = float("nan")
+    return scheduler_scenario, eval_scenario, gm
 
 
-def analyze_08_adapt_speed(prototype: bool) -> None:
-    """Fig 8: iterations to adapt to new scenario."""
-    print("analyze_08: not yet implemented")
+def analyze_07_cross_eval(prototype: bool, workers: int = 16) -> None:
+    """Fig 7: cross-eval heatmap — scheduler X evaluated on workload Y."""
+    import csv as _csv
+    import math
+    import tomllib
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    with (SPRING2026_DIR / "scenarios" / "scenarios.csv").open() as f:
+        scenarios = list(_csv.DictReader(f))
+
+    if prototype:
+        # Prototype: use reasoning/high schedulers (quick smoke-test, scale=1 only)
+        sched_dir = SCHEDULERS_DIR / "reasoning" / "high"
+        sched_files = sorted(sched_dir.glob("scheduler_*.py"))
+        assert sched_files, f"No schedulers in {sched_dir}"
+        sched_files = sched_files[:12]
+        scenarios = scenarios[:12]
+
+        tasks = []
+        for w_idx, scenario in enumerate(scenarios):
+            eval_scenario = f"scenario_{w_idx:02d}"
+            params = get_canonical_base_params(prototype=True)
+            toml_path = (SPRING2026_DIR / "scenarios" / scenario["params"]).resolve()
+            with toml_path.open("rb") as f:
+                params.update(tomllib.load(f))
+            trace_file = str((SPRING2026_DIR / "scenarios" / scenario["test_trace"]).resolve())
+            for sched_path in sched_files:
+                tasks.append((sched_path.stem, eval_scenario, str(sched_path), trace_file, params, [1]))
+    else:
+        # Full: for each scenario find the best scheduler produced by experiment 06
+        # (lowest finite geomean_latency in results/06_multi_iter/iterations*.csv)
+        iter_csvs = sorted((RESULTS_DIR / "06_multi_iter").glob("iterations*.csv"))
+        assert iter_csvs, "No iterations CSV in results/06_multi_iter — run analyze 06 first"
+        iter_csv = iter_csvs[-1]
+
+        best: dict[str, tuple[int, float]] = {}  # scenario_id → (iteration, geomean)
+        with iter_csv.open() as f:
+            for row in _csv.DictReader(f):
+                sid = row["scenario_id"]
+                try:
+                    gm = float(row["geomean_latency"])
+                except ValueError:
+                    continue
+                if not math.isfinite(gm):
+                    continue
+                it = int(row["iteration"])
+                if sid not in best or gm < best[sid][1]:
+                    best[sid] = (it, gm)
+
+        assert best, "No finite geomean rows found in 06 iterations CSV"
+
+        best_scheds: dict[str, Path] = {}
+        for sid, (it, _) in best.items():
+            p = SCHEDULERS_DIR / "multi_iter" / sid / f"iter_{it:03d}.py"
+            assert p.exists(), f"Missing best scheduler: {p}"
+            best_scheds[sid] = p
+
+        print(f"Best schedulers from 06 ({iter_csv.name}):")
+        for sid in sorted(best_scheds):
+            it, gm = best[sid]
+            print(f"  {sid}: iter_{it:03d}.py  (geomean={gm:.4f}s)")
+
+        tasks = []
+        for w_idx, scenario in enumerate(scenarios):
+            eval_scenario = f"scenario_{w_idx:02d}"
+            params = get_canonical_base_params(prototype=False)
+            toml_path = (SPRING2026_DIR / "scenarios" / scenario["params"]).resolve()
+            with toml_path.open("rb") as f:
+                params.update(tomllib.load(f))
+            trace_file = str((SPRING2026_DIR / "scenarios" / scenario["test_trace"]).resolve())
+            for sched_scenario in sorted(best_scheds):
+                tasks.append((
+                    sched_scenario, eval_scenario,
+                    str(best_scheds[sched_scenario]), trace_file,
+                    params, [1, 2, 4, 8, 16],
+                ))
+
+    out_dir = RESULTS_DIR / "07_cross_eval"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = out_dir / "cross_eval.csv"
+
+    total = len(tasks)
+    n_scheds = len({t[0] for t in tasks})
+    n_evals = len({t[1] for t in tasks})
+    print(f"Schedulers: {n_scheds}  Eval scenarios: {n_evals}  Total cells: {total}  Workers: {workers}")
+
+    with csv_path.open("w", newline="") as out_f:
+        writer = _csv.writer(out_f)
+        writer.writerow(["scheduler_scenario", "eval_scenario", "geomean_latency"])
+
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(_cross_eval_geomean_worker, t): t for t in tasks}
+            done = 0
+            for future in as_completed(futures):
+                sched_scenario, eval_scenario, gm = future.result()
+                done += 1
+                gm_str = f"{gm:.4f}" if math.isfinite(gm) else "nan"
+                print(f"  [{done}/{total}] {sched_scenario} × {eval_scenario}: {gm_str}")
+                writer.writerow([sched_scenario, eval_scenario, gm_str])
+                out_f.flush()
+
+    print(f"\nOutput: {csv_path}")
 
 
-def analyze_09_general_purpose(prototype: bool) -> None:
-    """Fig 9: general-purpose scheduler over all scenarios."""
-    print("analyze_09: not yet implemented")
+def analyze_08_adapt_speed(prototype: bool, dry_run: bool = False) -> None:
+    """Fig 8: adapt a scheduler from scenario A to scenario B, latency vs iteration."""
+    import csv as _csv
+    import importlib.util
+    import math
+    import random
+    import tomllib
+
+    _spec = importlib.util.spec_from_file_location(
+        "exp08_config", EXPERIMENTS_DIR / "08_adapt_speed" / "config.py"
+    )
+    assert _spec is not None and _spec.loader is not None
+    _cfg = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_cfg)  # type: ignore[union-attr]
+
+    with (SPRING2026_DIR / "scenarios" / "scenarios.csv").open() as f:
+        all_scenarios = list(_csv.DictReader(f))
+
+    # Use the same strided sampling as experiment 06 so scenario indices are consistent
+    n_samp = 2 if prototype else _cfg.N_SCENARIOS
+    _stride = max(1, len(all_scenarios) // n_samp)
+    sampled_scenarios = all_scenarios[::_stride][:n_samp]
+
+    # Prototype: one pair per direction using the two sampled scenarios, 3 iterations
+    pairs = [(0, 1), (1, 0)] if prototype else _cfg.PAIRS
+    n_iterations = 3 if prototype else _cfg.N_ITERATIONS
+
+    # Load best-per-scenario from experiment 06
+    best: dict[str, tuple[int, float]] = {}
+    if not dry_run:
+        iter_csvs = sorted((RESULTS_DIR / "06_multi_iter").glob("iterations*.csv"))
+        assert iter_csvs, "No iterations CSV in results/06_multi_iter — run analyze 06 first"
+        iter_csv = iter_csvs[-1]
+        with iter_csv.open() as f:
+            for row in _csv.DictReader(f):
+                sid = row["scenario_id"]
+                try:
+                    gm = float(row["geomean_latency"])
+                except ValueError:
+                    continue
+                if not math.isfinite(gm):
+                    continue
+                it = int(row["iteration"])
+                if sid not in best or gm < best[sid][1]:
+                    best[sid] = (it, gm)
+
+    out_dir = RESULTS_DIR / "08_adapt_speed"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = out_dir / "adaptation.csv"
+
+    with csv_path.open("w", newline="") as out_f:
+        writer = _csv.writer(out_f)
+        writer.writerow(["source_scenario", "target_scenario", "iteration", "geomean_latency"])
+
+        for src_idx, tgt_idx in pairs:
+            source_scenario = f"scenario_{src_idx:02d}"
+            target_scenario = f"scenario_{tgt_idx:02d}"
+            pair_label = f"{source_scenario}→{target_scenario}"
+            print(f"\n--- {pair_label} ---")
+
+            assert tgt_idx < len(sampled_scenarios), f"Target index {tgt_idx} out of range (sampled {len(sampled_scenarios)} scenarios)"
+            tgt = sampled_scenarios[tgt_idx]
+            base_params = get_canonical_base_params(prototype=prototype)
+            toml_path = (SPRING2026_DIR / "scenarios" / tgt["params"]).resolve()
+            with toml_path.open("rb") as f:
+                base_params.update(tomllib.load(f))
+            trace_file = str((SPRING2026_DIR / "scenarios" / tgt["train_trace"]).resolve())
+
+            adapt_dir = SCHEDULERS_DIR / "adapt_speed" / f"{source_scenario}_to_{target_scenario}"
+            adapt_dir.mkdir(parents=True, exist_ok=True)
+            iter_0 = adapt_dir / "iter_000.py"
+
+            if dry_run:
+                if not iter_0.exists():
+                    iter_0.write_text("# dry-run seed\n")
+            else:
+                assert source_scenario in best, (
+                    f"{source_scenario} not in 06 results — check that 06 ran with enough scenarios"
+                )
+                src_it, src_gm = best[source_scenario]
+                src_path = SCHEDULERS_DIR / "multi_iter" / source_scenario / f"iter_{src_it:03d}.py"
+                assert src_path.exists(), f"Missing source scheduler: {src_path}"
+                print(f"  Source: {source_scenario} iter_{src_it:03d}.py (geomean={src_gm:.4f}s on source)")
+                iter_0.write_text(src_path.read_text())
+
+            for it in range(n_iterations):
+                iter_path = adapt_dir / f"iter_{it:03d}.py"
+                next_path = adapt_dir / f"iter_{it + 1:03d}.py"
+
+                try:
+                    if dry_run:
+                        random.seed(src_idx * 10000 + tgt_idx * 1000 + it)
+                        gm = max(50.0, 500.0 * (0.97 ** it) + random.uniform(-10, 10))
+                        next_path.write_text(f"# dry-run iter {it + 1}\n")
+                    else:
+                        from one_iteration_tool import (
+                            evaluate_across_scales, build_improvement_prompt,
+                            call_llm, extract_code, geometric_mean,
+                        )
+                        assert iter_path.exists(), f"Missing {iter_path}"
+                        scale_results = evaluate_across_scales(iter_path, trace_file, [1, 2, 4, 8, 16], base_params)
+                        valid = [r["latency"] for r in scale_results.values() if r.get("ok")]
+                        gm = geometric_mean(valid) if valid else float("nan")
+                        prompt = build_improvement_prompt(iter_path.read_text(), scale_results, base_params)
+                        improved = extract_code(call_llm(prompt, _cfg.MODEL, _cfg.REASONING_EFFORT, False))
+                        if not re.search(r"""@register_scheduler\((?:key=)?['"]([^'"]+)['"]\)""", improved):
+                            raise ValueError("LLM output missing @register_scheduler key")
+                        next_path.write_text(improved + "\n")
+                except Exception as exc:
+                    import traceback
+                    print(f"  [{pair_label}] iter {it:>2}/{n_iterations}: ERROR — {exc}")
+                    print(traceback.format_exc())
+                    gm = float("nan")
+                    if not next_path.exists():
+                        next_path.write_text(iter_path.read_text())
+
+                writer.writerow([source_scenario, target_scenario, it, round(gm, 4)])
+                out_f.flush()
+                print(f"  [{pair_label}] iter {it + 1:>2}/{n_iterations}: geomean={gm:.4f}s")
+
+    print(f"\nOutput: {csv_path}")
+
+
+def analyze_09_general_purpose(prototype: bool, dry_run: bool = False) -> None:
+    """Fig 9: one scheduler optimized across all scenarios simultaneously."""
+    import csv as _csv
+    import importlib.util
+    import math
+    import random
+    import tomllib
+
+    _spec = importlib.util.spec_from_file_location(
+        "exp09_config", EXPERIMENTS_DIR / "09_general_purpose" / "config.py"
+    )
+    assert _spec is not None and _spec.loader is not None
+    _cfg = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_cfg)  # type: ignore[union-attr]
+
+    n_scenarios = 3 if prototype else _cfg.N_SCENARIOS
+    n_iterations = 3 if prototype else _cfg.N_ITERATIONS
+
+    with (SPRING2026_DIR / "scenarios" / "scenarios.csv").open() as f:
+        _all = list(_csv.DictReader(f))
+    _stride = max(1, len(_all) // n_scenarios)
+    scenarios = _all[::_stride][:n_scenarios]
+
+    # Pre-load per-scenario trace files and params (done once, reused every iteration)
+    scenario_ids = [f"scenario_{i:02d}" for i in range(n_scenarios)]
+    scenario_traces: list[str] = []
+    scenario_params: list[dict] = []
+    for scenario in scenarios:
+        bp = get_canonical_base_params(prototype=prototype)
+        toml_path = (SPRING2026_DIR / "scenarios" / scenario["params"]).resolve()
+        with toml_path.open("rb") as f:
+            bp.update(tomllib.load(f))
+        scenario_params.append(bp)
+        scenario_traces.append(str((SPRING2026_DIR / "scenarios" / scenario["train_trace"]).resolve()))
+
+    sched_dir = SCHEDULERS_DIR / "general_purpose"
+    sched_dir.mkdir(parents=True, exist_ok=True)
+    iter_0 = sched_dir / "iter_000.py"
+    if dry_run:
+        if not iter_0.exists():
+            iter_0.write_text("# dry-run seed\n")
+    else:
+        seed_files = sorted((SCHEDULERS_DIR / "reasoning" / "low").glob("scheduler_*.py"))
+        assert seed_files, "No seed schedulers in reasoning/low. Run analyze_01_reasoning first."
+        iter_0.write_text(seed_files[0].read_text())  # type: ignore[possibly-undefined]
+
+    out_dir = RESULTS_DIR / "09_general_purpose"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = out_dir / "iterations.csv"
+
+    with csv_path.open("w", newline="") as out_f:
+        writer = _csv.writer(out_f)
+        writer.writerow(["iteration", "overall_geomean"] + [f"{sid}_latency" for sid in scenario_ids])
+
+        for it in range(n_iterations):
+            iter_path = sched_dir / f"iter_{it:03d}.py"
+            next_path = sched_dir / f"iter_{it + 1:03d}.py"
+            scenario_gms: list[float] = []
+
+            try:
+                if dry_run:
+                    for i in range(n_scenarios):
+                        random.seed(i * 1000 + it)
+                        scenario_gms.append(max(50.0, 500.0 * (0.97 ** it) + random.uniform(-30, 30)))
+                    next_path.write_text(f"# dry-run iter {it + 1}\n")
+                else:
+                    from one_iteration_tool import (
+                        evaluate_across_scales, call_llm, extract_code, geometric_mean,
+                    )
+                    assert iter_path.exists(), f"Missing {iter_path}"
+                    for sid, trace_file, bp in zip(scenario_ids, scenario_traces, scenario_params):
+                        print(f"  [iter {it:02d}] {sid}...", flush=True)
+                        scale_results = evaluate_across_scales(iter_path, trace_file, [1, 2, 4, 8, 16], bp)
+                        valid = [r["latency"] for r in scale_results.values() if r.get("ok")]
+                        scenario_gms.append(geometric_mean(valid) if valid else float("nan"))
+
+                    finite = [g for g in scenario_gms if math.isfinite(g)]
+                    overall_gm = geometric_mean(finite) if finite else float("nan")
+
+                    scheduler_code = iter_path.read_text()
+                    m = re.search(r"""@register_scheduler\((?:key=)?['"]([^'"]+)['"]\)""", scheduler_code)
+                    policy_key = m.group(1) if m else "unknown"
+                    perf_lines = "\n".join(
+                        f"  {sid}: {gm:.4f}s" if math.isfinite(gm) else f"  {sid}: FAILED"
+                        for sid, gm in zip(scenario_ids, scenario_gms)
+                    )
+                    prompt = (
+                        f"## Performance Results (geomean over cluster scales 1x–16x, per workload)\n\n"
+                        f"{perf_lines}\n\n"
+                        f"Overall geomean across {n_scenarios} workloads: {overall_gm:.4f}s\n\n"
+                        f"## Current Scheduler Code\n\n{scheduler_code}\n\n"
+                        f"Produce an improved version that minimizes the overall geomean across all "
+                        f"workloads. Use the EXACT key \"{policy_key}\" in both "
+                        f"@register_scheduler_init and @register_scheduler. "
+                        f"Output ONLY the complete Python code."
+                    )
+                    improved = extract_code(call_llm(prompt, _cfg.MODEL, _cfg.REASONING_EFFORT, False))
+                    if not re.search(r"""@register_scheduler\((?:key=)?['"]([^'"]+)['"]\)""", improved):
+                        raise ValueError("LLM output missing @register_scheduler key")
+                    next_path.write_text(improved + "\n")
+
+            except Exception as exc:
+                import traceback
+                print(f"  [iter {it:02d}] ERROR — {exc}")
+                print(traceback.format_exc())
+                scenario_gms = [float("nan")] * n_scenarios
+                if not next_path.exists():
+                    next_path.write_text(iter_path.read_text())
+
+            finite = [g for g in scenario_gms if math.isfinite(g)]
+            overall_gm = geometric_mean(finite) if finite else float("nan")  # type: ignore[possibly-undefined]
+            row = [it, round(overall_gm, 4) if math.isfinite(overall_gm) else "nan"]
+            row += [round(g, 4) if math.isfinite(g) else "nan" for g in scenario_gms]
+            writer.writerow(row)
+            out_f.flush()
+            per_s = "  ".join(f"{g:.2f}" if math.isfinite(g) else "nan" for g in scenario_gms)
+            print(f"  iter {it + 1:>2}/{n_iterations}: overall={overall_gm:.4f}s  [{per_s}]")
+
+    print(f"\nOutput: {csv_path}")
 
 
 HANDLERS = {

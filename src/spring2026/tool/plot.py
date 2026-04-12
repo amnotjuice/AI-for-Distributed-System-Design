@@ -729,18 +729,171 @@ def plot_06_multi_iter() -> None:
 
 
 def plot_07_cross_eval() -> None:
-    """Fig 7: cross-eval heatmap."""
-    print("plot_07: not yet implemented")
+    """Fig 7: cross-eval heatmap — scheduler (y-axis) × workload (x-axis) latency."""
+    candidates = sorted((RESULTS_DIR / "07_cross_eval").glob("cross_eval*.csv"))
+    if not candidates:
+        print("  No results yet for 07_cross_eval — run analyze.py 07_cross_eval first")
+        return
+
+    rows_data: dict[str, dict[str, float]] = {}
+    with candidates[-1].open() as f:
+        for row in csv.DictReader(f):
+            try:
+                lat = float(row["latency"])
+            except ValueError:
+                lat = float("nan")
+            rows_data.setdefault(row["scheduler_id"], {})[row["workload_id"]] = lat
+
+    if not rows_data:
+        print("  cross_eval CSV is empty")
+        return
+
+    schedulers = sorted(rows_data)
+    workloads = sorted({w for d in rows_data.values() for w in d})
+    matrix = np.full((len(schedulers), len(workloads)), np.nan)
+    for i, s in enumerate(schedulers):
+        for j, w in enumerate(workloads):
+            matrix[i, j] = rows_data[s].get(w, np.nan)
+
+    cmap = plt.get_cmap("YlOrRd").copy()
+    cmap.set_bad(color="#cccccc")
+
+    fig, ax = plt.subplots(figsize=(4.5, 4.0))
+    im = ax.imshow(np.ma.masked_invalid(matrix), aspect="auto", cmap=cmap, interpolation="nearest")
+
+    cbar = fig.colorbar(im, ax=ax, shrink=0.7, pad=0.02)
+    cbar.set_label("Latency (s)", fontsize=6)
+    cbar.ax.tick_params(labelsize=5)
+
+    ax.set_xticks(np.arange(len(workloads)))
+    ax.set_xticklabels([w.replace("scenario_", "s") for w in workloads],
+                       fontsize=4, rotation=90, ha="center")
+    ax.set_yticks(np.arange(len(schedulers)))
+    ax.set_yticklabels([s.split("_")[-1] for s in schedulers], fontsize=4)
+    ax.set_xlabel("Workload", fontsize=7)
+    ax.set_ylabel("Scheduler", fontsize=7)
+    ax.tick_params(axis="both", length=2)
+    ax.grid(False)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    _save(fig, PLOTS_DIR / "07_cross_eval" / "fig7")
 
 
 def plot_08_adapt_speed() -> None:
-    """Fig 8: iterations to adapt to new scenario."""
-    print("plot_08: not yet implemented")
+    """Fig 8: adaptation speed — latency vs iteration, one line per source→target pair."""
+    adapt_csv = RESULTS_DIR / "08_adapt_speed" / "adaptation.csv"
+    if not adapt_csv.exists():
+        print("  No results yet for 08_adapt_speed — run analyze.py 08_adapt_speed first")
+        return
+
+    data: dict[tuple[str, str], list[tuple[int, float]]] = {}
+    with adapt_csv.open() as f:
+        for row in csv.DictReader(f):
+            key = (row["source_scenario"], row["target_scenario"])
+            try:
+                gm = float(row["geomean_latency"])
+            except ValueError:
+                gm = float("nan")
+            data.setdefault(key, []).append((int(row["iteration"]), gm))
+    if not data:
+        print("  adaptation.csv is empty")
+        return
+
+    # 06 best-per-target as "trained from scratch" reference lines
+    target_best: dict[str, float] = {}
+    candidates = sorted((RESULTS_DIR / "06_multi_iter").glob("iterations*.csv"))
+    if candidates:
+        with candidates[-1].open() as f:
+            for row in csv.DictReader(f):
+                try:
+                    gm = float(row["geomean_latency"])
+                except ValueError:
+                    continue
+                if np.isfinite(gm):
+                    sid = row["scenario_id"]
+                    target_best[sid] = min(target_best.get(sid, np.inf), gm)
+
+    pairs = sorted(data)
+    colors = plt.get_cmap("tab10")
+    fig, ax = plt.subplots(figsize=(3.5, 2.8))
+
+    for i, (src, tgt) in enumerate(pairs):
+        color = colors(i % 10)
+        points = sorted(data[(src, tgt)])
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
+        label = f"{src.replace('scenario_', 's')}→{tgt.replace('scenario_', 's')}"
+        ax.plot(xs, ys, color=color, linewidth=0.9, label=label)
+        if tgt in target_best:
+            ax.axhline(target_best[tgt], color=color, linewidth=0.7, linestyle="--", alpha=0.6)
+
+    ax.set_xlabel("Iteration", fontsize=7)
+    ax.set_ylabel("Geomean Latency (s)", fontsize=7)
+    ax.tick_params(axis="both", labelsize=6)
+    ax.legend(frameon=False, fontsize=5, ncol=2, loc="upper right")
+    _style_axes(ax)
+    _save(fig, PLOTS_DIR / "08_adapt_speed" / "fig8")
 
 
 def plot_09_general_purpose() -> None:
-    """Fig 9: general-purpose scheduler performance."""
-    print("plot_09: not yet implemented")
+    """Fig 9: general-purpose vs specialized scheduler, latency vs iteration."""
+    from matplotlib.lines import Line2D
+
+    csv_path = RESULTS_DIR / "09_general_purpose" / "iterations.csv"
+    if not csv_path.exists():
+        print("  No results yet for 09_general_purpose — run analyze.py 09_general_purpose first")
+        return
+
+    with csv_path.open() as f:
+        rows = list(csv.DictReader(f))
+    if not rows:
+        print("  iterations.csv is empty")
+        return
+
+    scenario_cols = sorted(k for k in rows[0] if k.endswith("_latency"))
+    iterations = [int(r["iteration"]) for r in rows]
+    overall    = [float(r["overall_geomean"]) for r in rows]
+    per_sc     = {col: [float(r[col]) for r in rows] for col in scenario_cols}
+
+    # 06 best-per-scenario as specialized reference lines
+    specialized_best: dict[str, float] = {}
+    candidates = sorted((RESULTS_DIR / "06_multi_iter").glob("iterations*.csv"))
+    if candidates:
+        with candidates[-1].open() as f:
+            for row in csv.DictReader(f):
+                try:
+                    gm = float(row["geomean_latency"])
+                except ValueError:
+                    continue
+                if np.isfinite(gm):
+                    sid = row["scenario_id"]
+                    specialized_best[sid] = min(specialized_best.get(sid, np.inf), gm)
+
+    fig, ax = plt.subplots(figsize=(3.5, 2.8))
+    colors = plt.get_cmap("tab10")
+
+    for i, col in enumerate(scenario_cols):
+        color = colors(i % 10)
+        ax.plot(iterations, per_sc[col], color=color, linewidth=0.7, alpha=0.3)
+        sid = col.replace("_latency", "")
+        if sid in specialized_best:
+            ax.axhline(specialized_best[sid], color=color, linewidth=0.6, linestyle="--", alpha=0.35)
+
+    ax.plot(iterations, overall, color="#1a1a2e", linewidth=1.8, zorder=5)
+
+    legend_handles = [
+        Line2D([0], [0], color="#1a1a2e", linewidth=1.8,           label="Overall geomean"),
+        Line2D([0], [0], color="gray",    linewidth=0.7, alpha=0.5, label="Per-scenario latency"),
+        Line2D([0], [0], color="gray",    linewidth=0.6, alpha=0.5,
+               linestyle="--",                                       label="Specialized best (exp 06)"),
+    ]
+    ax.legend(handles=legend_handles, frameon=False, fontsize=5, loc="upper right")
+    ax.set_xlabel("Iteration", fontsize=7)
+    ax.set_ylabel("Geomean Latency (s)", fontsize=7)
+    ax.tick_params(axis="both", labelsize=6)
+    _style_axes(ax)
+    _save(fig, PLOTS_DIR / "09_general_purpose" / "fig9")
 
 
 PLOT_HANDLERS = {

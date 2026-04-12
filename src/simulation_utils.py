@@ -168,9 +168,13 @@ def extract_metrics_from_stats(
     """
     if metric == "latency":
         from eudoxia.utils import Priority
+        import inspect
         weights = {Priority.QUERY: 10, Priority.INTERACTIVE: 5, Priority.BATCH_PIPELINE: 1}
         max_job_seconds = (base_params or {}).get("max_job_seconds", 0)
-        if max_job_seconds and max_job_seconds > 0:
+        _supports_penalty = "unfinished_penalty_seconds" in inspect.signature(
+            raw_stats[0].adjusted_latency if raw_stats else SimulatorStats.adjusted_latency
+        ).parameters
+        if max_job_seconds and max_job_seconds > 0 and _supports_penalty:
             penalty = 2 * max_job_seconds
             return [s.adjusted_latency(
                 weights=weights,
