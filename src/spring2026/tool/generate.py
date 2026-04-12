@@ -130,13 +130,17 @@ def _select_source_scheduler(source: str) -> tuple:
     functional = [r for r in records if r.get("functional") and r.get("median_latency") is not None]
     assert functional, "No functional schedulers in 01_reasoning/low results"
 
+    def _gmean(r):
+        finite = [v for v in r.get("metric_values", []) if v != float('inf') and v > 0]
+        return _statistics.geometric_mean(finite) if finite else float('inf')
+
     if source == "best":
-        chosen = min(functional, key=lambda r: r["median_latency"])
+        chosen = min(functional, key=_gmean)
     elif source == "worst":
-        chosen = max(functional, key=lambda r: r["median_latency"])
+        chosen = max(functional, key=_gmean)
     else:  # median
-        med_val = _statistics.median(r["median_latency"] for r in functional)
-        chosen = min(functional, key=lambda r: abs(r["median_latency"] - med_val))
+        med_val = _statistics.median(_gmean(r) for r in functional)
+        chosen = min(functional, key=lambda r: abs(_gmean(r) - med_val))
 
     sched_path = SCHEDULERS_DIR / "reasoning" / "low" / chosen["filename"]
     assert sched_path.exists(), f"Scheduler file not found: {sched_path}"
