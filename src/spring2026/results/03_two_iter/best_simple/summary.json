@@ -1,0 +1,13 @@
+{
+  "combo": "best_simple",
+  "source": "best",
+  "context": "simple",
+  "source_filename": "scheduler_low_037.py",
+  "source_median_latency": 162.25810698957693,
+  "n_total": 20,
+  "n_functional": 11,
+  "n_improved": 5,
+  "improved_rate": 0.25,
+  "improved_lo": 0.11186005278940309,
+  "improved_hi": 0.4687050099580636
+}

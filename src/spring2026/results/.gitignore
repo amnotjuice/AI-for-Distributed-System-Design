@@ -1,3 +1,13 @@
 # Raw simulation output — not committed
 *
 !.gitignore
+!01_reasoning/
+!01_reasoning/**/
+!01_reasoning/**/*.jsonl
+!03_two_iter/
+!03_two_iter/median_simple/
+!03_two_iter/median_simple/*.jsonl
+!03_two_iter/median_simple/*.json
+!03_two_iter/median_rich/
+!03_two_iter/median_rich/*.jsonl
+!03_two_iter/median_rich/*.json

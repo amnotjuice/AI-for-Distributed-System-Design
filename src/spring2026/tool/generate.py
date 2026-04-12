@@ -130,47 +130,21 @@ def _select_source_scheduler(source: str) -> tuple:
     functional = [r for r in records if r.get("functional") and r.get("median_latency") is not None]
     assert functional, "No functional schedulers in 01_reasoning/low results"
 
+    def _gmean(r):
+        finite = [v for v in r.get("metric_values", []) if v != float('inf') and v > 0]
+        return _statistics.geometric_mean(finite) if finite else float('inf')
+
     if source == "best":
-        chosen = min(functional, key=lambda r: r["median_latency"])
+        chosen = min(functional, key=_gmean)
     elif source == "worst":
-        chosen = max(functional, key=lambda r: r["median_latency"])
+        chosen = max(functional, key=_gmean)
     else:  # median
-        med_val = _statistics.median(r["median_latency"] for r in functional)
-        chosen = min(functional, key=lambda r: abs(r["median_latency"] - med_val))
+        med_val = _statistics.median(_gmean(r) for r in functional)
+        chosen = min(functional, key=lambda r: abs(_gmean(r) - med_val))
 
     sched_path = SCHEDULERS_DIR / "reasoning" / "low" / chosen["filename"]
     assert sched_path.exists(), f"Scheduler file not found: {sched_path}"
     return chosen, sched_path
-
-
-def _get_rich_stats(scheduler_code: str, policy_key: str) -> list:
-    """Run source scheduler on canonical_train trace and return stats as dicts."""
-    from typing import List, Tuple
-    from eudoxia.executor.assignment import Assignment, ExecutionResult, Suspend
-    from eudoxia.scheduler.decorators import register_scheduler, register_scheduler_init
-    from eudoxia.utils import Priority
-    from eudoxia.workload import OperatorState, Pipeline
-    from eudoxia.workload.runtime_status import ASSIGNABLE_STATES
-    from spring2026.tool.config import TRACES_DIR, get_canonical_base_params
-    from simulation_utils import get_raw_stats_for_policy
-
-    from eudoxia.scheduler.decorators import INIT_ALGOS, SCHEDULING_ALGOS
-    SCHEDULING_ALGOS.pop(policy_key, None)
-    INIT_ALGOS.pop(policy_key, None)
-
-    exec(scheduler_code, {
-        "__builtins__": __builtins__, "List": List, "Tuple": Tuple,
-        "Pipeline": Pipeline, "OperatorState": OperatorState,
-        "ASSIGNABLE_STATES": ASSIGNABLE_STATES, "Assignment": Assignment,
-        "ExecutionResult": ExecutionResult, "Suspend": Suspend,
-        "register_scheduler_init": register_scheduler_init,
-        "register_scheduler": register_scheduler, "Priority": Priority,
-    })
-
-    base_params = get_canonical_base_params()
-    canonical = str(TRACES_DIR / "bench_canonical_train.csv")
-    raw = get_raw_stats_for_policy(base_params, [canonical], policy_key)
-    return [s.to_dict() for s in raw]
 
 
 def generate_two_iter_scheduler(
@@ -181,7 +155,7 @@ def generate_two_iter_scheduler(
     output_dir: Path,
     model: str,
     verbose: bool,
-    raw_stats_dicts: list | None,
+    source_stats: dict | None,
 ) -> Path | None:
     """Generate one two-iteration scheduler from the source + feedback."""
     output_path = output_dir / f"{policy_key}.py"
@@ -196,10 +170,10 @@ def generate_two_iter_scheduler(
             f"Please improve it to reduce latency further."
         )
     else:  # rich
-        stats_json = json.dumps(raw_stats_dicts, indent=2) if raw_stats_dicts else "[]"
+        stats_json = json.dumps(source_stats, indent=2) if source_stats else "{}"
         feedback_text = (
             f"This scheduler achieved a median weighted latency of {source_latency:.2f}s.\n\n"
-            f"Here are the per-trace simulation statistics:\n{stats_json}\n\n"
+            f"Here are the simulation statistics:\n{stats_json}\n\n"
             f"Please improve it to reduce latency further."
         )
 
@@ -397,13 +371,7 @@ def _run_two_iter(args) -> None:
     print(f"\nSource: {source_path.name}  |  median_latency={source_latency:.4f}")
     print(f"context={args.context}  n={args.n}  model={args.model}")
 
-    raw_stats_dicts = None
-    if args.context == "rich":
-        key_match = re.search(r"""@register_scheduler\((?:key=)?['"]([^'"]+)['"]\)""", source_code)
-        assert key_match, "No scheduler key found in source code"
-        print("Running simulation for rich context stats...")
-        raw_stats_dicts = _get_rich_stats(source_code, key_match.group(1))
-        print(f"  Got {len(raw_stats_dicts)} trace stats")
+    source_stats = source_record if args.context == "rich" else None
 
     combo = f"{args.source}_{args.context}"
     output_dir = SCHEDULERS_DIR / "two_iter" / combo
@@ -434,7 +402,7 @@ def _run_two_iter(args) -> None:
             output_dir=output_dir,
             model=args.model,
             verbose=args.verbose,
-            raw_stats_dicts=raw_stats_dicts,
+            source_stats=source_stats,
         )
         if p:
             generated.append(p)

@@ -60,6 +60,15 @@ def probe_no_deadlock(
     try:
         raw = get_raw_stats_for_policy(params, trace_files[:1], key_match.group(1))
 
+        if len(raw) == 0:
+            # run_simulation_with_trace swallows the IndexError eudoxia raises when
+            # no containers complete and returns None, which gets filtered out here.
+            # Zero results for this probe means the scheduler assigned nothing.
+            return {
+                "functional": False, "failure_mode": "deadlock",
+                "error_message": "No containers completed (scheduler made no forward progress)",
+            }
+
         if len(raw) != 1:
             return {
                 "functional": False, "failure_mode": "simulation_error",
