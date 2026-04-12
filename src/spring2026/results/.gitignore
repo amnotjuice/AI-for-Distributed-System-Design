@@ -1,3 +1,6 @@
 # Raw simulation output — not committed
 *
 !.gitignore
+!01_reasoning/
+!01_reasoning/**/
+!01_reasoning/**/*.jsonl
