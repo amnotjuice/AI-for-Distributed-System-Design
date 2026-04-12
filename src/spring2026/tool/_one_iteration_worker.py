@@ -58,12 +58,16 @@ def main() -> None:
         from eudoxia.simulator import run_simulator
         from eudoxia.workload.csv_io import CSVWorkloadReader
 
+        from eudoxia.utils import Priority
+
         params["scheduler_algo"] = policy_key
         with open(trace_file) as f:
             reader = CSVWorkloadReader(f)
             workload = reader.get_workload(params["ticks_per_second"])
             stats = run_simulator(params, workload=workload)
-        print("__RESULT__" + json.dumps({"ok": True, "latency": stats.adjusted_latency()}))
+        weights = {Priority.QUERY: 10, Priority.INTERACTIVE: 5, Priority.BATCH_PIPELINE: 1}
+        latency = stats.adjusted_latency(weights=weights, divide_by_completion_rate=True)
+        print("__RESULT__" + json.dumps({"ok": True, "latency": latency}))
     except Exception as exc:
         print("__RESULT__" + json.dumps({"ok": False, "error": str(exc)}))
 

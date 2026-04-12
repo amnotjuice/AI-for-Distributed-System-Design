@@ -27,6 +27,9 @@ sys.path.insert(0, str(TOOL_DIR))
 sys.path.insert(0, str(SRC_DIR))
 sys.path.insert(0, str(PROBE_DIR))
 
+import logging as _logging
+_logging.getLogger("simulation_utils").setLevel(_logging.ERROR)
+
 from config import get_canonical_base_params
 from generate_probe_traces import PRESETS, generate_probe_trace
 from probe_syntax import probe_syntax

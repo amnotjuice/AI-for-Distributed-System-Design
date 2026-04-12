@@ -19,7 +19,7 @@ import re
 from collections import defaultdict
 from pathlib import Path
 
-OBJECTIVES = ["weight_1", "weight_2"]
+OBJECTIVES = ["basic", "prio"]
 
 
 def main() -> None:
@@ -32,15 +32,15 @@ def main() -> None:
     assert args.traces.is_dir(), f"Not a directory: {args.traces}"
     assert args.params.is_dir(), f"Not a directory: {args.params}"
 
-    # Group trace files by base name (strip trailing _<seed>)
-    groups: dict[str, dict[int, Path]] = defaultdict(dict)
+    # Group trace files by base name (strip trailing _train / _test)
+    groups: dict[str, dict[str, Path]] = defaultdict(dict)
     for t in sorted(args.traces.glob("*.csv")):
-        m = re.match(r"^(.+)_(\d+)\.csv$", t.name)
+        m = re.match(r"^(.+)_(train|test)\.csv$", t.name)
         if m:
-            groups[m.group(1)][int(m.group(2))] = t
+            groups[m.group(1)][m.group(2)] = t
 
-    pairs = [(g[0], g[1]) for g in (groups[b] for b in sorted(groups)) if 0 in g and 1 in g]
-    assert pairs, f"No seed-paired trace files found in {args.traces}"
+    pairs = [(g["train"], g["test"]) for g in (groups[b] for b in sorted(groups)) if "train" in g and "test" in g]
+    assert pairs, f"No train/test trace pairs found in {args.traces}"
 
     params_files = sorted(args.params.glob("*.toml"))
     assert params_files, f"No .toml files found in {args.params}"
