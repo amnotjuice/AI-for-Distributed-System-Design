@@ -257,9 +257,13 @@ def _draw_latency_cdf_by_effort(ax: plt.Axes, data: dict[str, np.ndarray]) -> No
 # Fig 2 helpers
 # ---------------------------------------------------------------------------
 
-def _load_probe_data_02() -> dict[str, float]:
-    """Load probe pass rates from results/02_estimation/probes.csv (single group)."""
-    path = RESULTS_DIR / "02_estimation" / "probes.csv"
+ESTIM_GROUP_ORDER  = ["no_estimates", "with_estimates"]
+ESTIM_GROUP_COLORS = {"no_estimates": "#a6cee3", "with_estimates": "#1f78b4"}
+ESTIM_GROUP_LABELS = {"no_estimates": "No Estimates", "with_estimates": "With Estimates"}
+
+
+def _load_probe_csv(path: Path) -> dict[str, float]:
+    """Load probe pass rates from a single probes.csv."""
     if not path.exists():
         return {}
     with open(path, newline="") as f:
@@ -271,6 +275,18 @@ def _load_probe_data_02() -> dict[str, float]:
         valid = [r[probe] for r in rows if r.get(probe) and r[probe] != "skipped"]
         rates[probe] = sum(1 for v in valid if v == "pass") / len(valid) * 100 if valid else float("nan")
     return rates
+
+
+def _load_probe_data_02() -> dict[str, dict[str, float]]:
+    """Load probe pass rates for two groups: no_estimates (exp01/low) and with_estimates (exp02)."""
+    data: dict[str, dict[str, float]] = {}
+    no_est = _load_probe_csv(RESULTS_DIR / "01_reasoning" / "low" / "probes.csv")
+    if no_est:
+        data["no_estimates"] = no_est
+    with_est = _load_probe_csv(RESULTS_DIR / "02_estimation" / "probes.csv")
+    if with_est:
+        data["with_estimates"] = with_est
+    return data
 
 
 def _load_latency_by_sigma() -> dict[str, np.ndarray]:
@@ -296,13 +312,24 @@ def _load_latency_by_sigma() -> dict[str, np.ndarray]:
     return result
 
 
-def _draw_probe_pass_rates_single(ax: plt.Axes, rates: dict[str, float]) -> None:
-    """Simple bar chart for a single group of probe pass rates."""
+def _draw_probe_pass_rates_02(ax: plt.Axes, data: dict[str, dict[str, float]]) -> None:
+    """Grouped bar chart for two probe groups: no_estimates and with_estimates."""
     probes = list(PROBE_LABELS.keys())
-    x = np.arange(len(probes))
-    values = [rates.get(p, float("nan")) for p in probes]
-    ax.bar(x, values, color="#6baed6", zorder=2, linewidth=0)
-    ax.set_xticks(x)
+    groups = [g for g in ESTIM_GROUP_ORDER if g in data]
+    n = len(groups)
+    if n == 0:
+        return
+    bar_width_total = 0.65
+    bar_width = bar_width_total / max(n, 1)
+    centers = np.arange(len(probes))
+
+    for i, group in enumerate(groups):
+        offsets = centers + (i - (n - 1) / 2) * bar_width
+        values = [data[group].get(p, float("nan")) for p in probes]
+        ax.bar(offsets, values, width=bar_width, label=ESTIM_GROUP_LABELS[group],
+               color=ESTIM_GROUP_COLORS[group], zorder=2, linewidth=0)
+
+    ax.set_xticks(centers)
     ax.set_xticklabels([PROBE_LABELS[p] for p in probes], fontsize=4, rotation=90, ha="center")
     ax.set_ylabel("% Passing", fontsize=5)
     ax.tick_params(axis="y", labelsize=5)
@@ -489,17 +516,22 @@ def plot_02_estimation() -> None:
         gridspec_kw={"width_ratios": [1, 1]},
     )
 
-    _draw_probe_pass_rates_single(ax_probes, probe_data)
+    _draw_probe_pass_rates_02(ax_probes, probe_data)
     ax_probes.set_title("(a) Scheduler Properties", fontsize=6)
 
     _draw_latency_cdf_by_sigma(ax_cdf, latency_data)
     ax_cdf.set_title("(b) Latency by Estimation Noise", fontsize=6)
 
+    probe_handles = [Patch(facecolor=ESTIM_GROUP_COLORS[g], label=ESTIM_GROUP_LABELS[g])
+                     for g in ESTIM_GROUP_ORDER if g in probe_data]
     present = [s for s in SIGMA_ORDER if s in latency_data]
-    handles = [Patch(facecolor=SIGMA_COLORS[s], label=SIGMA_LABELS[s]) for s in present]
-    fig.legend(handles=handles, frameon=False, fontsize=4, ncol=len(present),
-               loc="upper center", bbox_to_anchor=(0.5, 1.05))
+    sigma_handles = [Patch(facecolor=SIGMA_COLORS[s], label=SIGMA_LABELS[s]) for s in present]
 
+    all_handles = probe_handles + sigma_handles
+    fig.legend(handles=all_handles, frameon=False, fontsize=4,
+               ncol=len(all_handles), loc="upper center", bbox_to_anchor=(0.5, 1.0))
+
+    fig.tight_layout(rect=[0, 0, 1, 0.84])
     _save(fig, PLOTS_DIR / "02_estimation" / "fig2")
 
 
@@ -510,7 +542,7 @@ def plot_03_two_iter_best_worst() -> None:
         print("  No results yet for 03_two_iter — run analyze.py 03_two_iter_best_worst first")
         return
 
-    fig, ax = plt.subplots(figsize=(3.5, 2.2))
+    fig, ax = plt.subplots(figsize=(3.3, 1.8))
 
     bar_width = 0.28
     group_gap = 0.75
@@ -673,15 +705,15 @@ def plot_05_two_shot_perf(source: str = "worst", context: str = "rich") -> None:
     x = np.arange(len(labels))
     errs_arr = np.array(errs).T  # shape (2, n)
 
-    fig, ax = plt.subplots(figsize=(max(5.0, len(labels) * 1.4), 4))
+    fig, ax = plt.subplots(figsize=(3.5, 2.2))
     ax.bar(x, rates, color=colors, zorder=2)
     ax.errorbar(x, rates, yerr=errs_arr, fmt="none", ecolor="#333",
                 capsize=4, linewidth=1, zorder=3)
     ax.axhline(50, color="#aaaaaa", linewidth=0.8, linestyle="--")
     ax.set_xticks(x)
     ax.set_xticklabels(labels, fontsize=8)
-    ax.set_ylabel("% v1 Beat Source", fontsize=9)
-    ax.set_title("Two-Shot Improvement Rate by Sim Fidelity", fontsize=10)
+    ax.set_ylabel("% Schedulers Beat Source", fontsize=8)
+    ax.set_title("Two-Shot Improvement Rate by Sim Fidelity", fontsize=8)
     ax.set_ylim(0, 100)
     ax.legend(handles=[
         Patch(facecolor="#888888", label="Full fidelity"),
