@@ -11,7 +11,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import statistics as _statistics
 import sys
 import time
@@ -33,7 +32,7 @@ for name in ["eudoxia", "LiteLLM", "httpcore", "httpx", "openai._base_client"]:
 os.chdir(_SRC.parent)
 
 from llm import generate_policy, setup_cost_tracking, reset_cost_tracking, get_cost_statistics, get_last_request_cost
-from prompts import get_user_request_v2, get_user_request_v2_est
+from prompts import get_user_request
 from spring2026.tool.config import DEFAULT_MODEL, RESULTS_DIR, SCHEDULERS_DIR, SUPPORTED_EFFORTS, TWO_SHOT_PERF_CONDITIONS
 
 
@@ -52,11 +51,10 @@ def generate_one_scheduler(
         print(f"  {output_path.name} exists, skipping")
         return output_path
 
+    user_request = get_user_request(policy_key, "weighted latency")
     if exp == "estimation":
-        user_request = get_user_request_v2_est(policy_key)
         context_files = ["eudoxia_bauplan_est.md"]
     else:
-        user_request = get_user_request_v2(policy_key)
         context_files = ["eudoxia_bauplan.md"]
 
     gen_start = time.time()
@@ -182,7 +180,7 @@ def generate_two_iter_scheduler(
     gen_start = time.time()
     try:
         result = generate_policy(
-            user_request=get_user_request_v2(policy_key),
+            user_request=get_user_request(policy_key, "weighted latency"),
             feedback_history=feedback_history,
             model=model,
             temperature=1.0,
@@ -216,43 +214,6 @@ def generate_two_iter_scheduler(
     return output_path
 
 
-def _get_source_latency_cheap(source_code: str, policy_key: str, sim_overrides: dict) -> float:
-    """Run source on canonical_train with given sim overrides; return median adjusted_latency."""
-    from typing import List, Tuple
-    from eudoxia.executor.assignment import Assignment, ExecutionResult, Suspend
-    from eudoxia.scheduler.decorators import register_scheduler, register_scheduler_init
-    from eudoxia.utils import Priority
-    from eudoxia.workload import OperatorState, Pipeline
-    from eudoxia.workload.runtime_status import ASSIGNABLE_STATES
-    from spring2026.tool.config import TRACES_DIR, get_canonical_base_params
-    from simulation_utils import get_raw_stats_for_policy, extract_metrics_from_stats
-
-    from eudoxia.scheduler.decorators import INIT_ALGOS, SCHEDULING_ALGOS
-    SCHEDULING_ALGOS.pop(policy_key, None)
-    INIT_ALGOS.pop(policy_key, None)
-
-    exec(source_code, {
-        "__builtins__": __builtins__, "List": List, "Tuple": Tuple,
-        "Pipeline": Pipeline, "OperatorState": OperatorState,
-        "ASSIGNABLE_STATES": ASSIGNABLE_STATES, "Assignment": Assignment,
-        "ExecutionResult": ExecutionResult, "Suspend": Suspend,
-        "register_scheduler_init": register_scheduler_init,
-        "register_scheduler": register_scheduler, "Priority": Priority,
-    })
-
-    params = get_canonical_base_params()
-    params.update(sim_overrides)
-    canonical = str(TRACES_DIR / "bench_canonical_train.csv")
-    raw = []
-    for n_pools in [1, 2, 4, 8, 16]:
-        p = params.copy()
-        p["num_pools"] = n_pools
-        raw.extend(get_raw_stats_for_policy(p, [canonical], policy_key))
-
-    values = [float(v) for v in extract_metrics_from_stats(raw, "latency", base_params=params)]
-    finite = [v for v in values if v != float("inf")]
-    return _statistics.median(finite) if finite else float("inf")
-
 
 def generate_two_shot_perf_scheduler(
     source_code: str,
@@ -262,23 +223,34 @@ def generate_two_shot_perf_scheduler(
     output_dir: Path,
     model: str,
     verbose: bool,
+    context: str = "simple",
+    cheap_stats: dict | None = None,
 ) -> Path | None:
-    """Generate one two-shot-perf scheduler using simple feedback from a cheap simulation."""
+    """Generate one two-shot-perf scheduler using feedback from a cheap simulation."""
     output_path = output_dir / f"{policy_key}.py"
     if output_path.exists():
         print(f"  {output_path.name} exists, skipping")
         return output_path
 
-    feedback_text = (
-        f"This scheduler achieved a median weighted latency of {cheap_latency:.2f}s. "
-        f"Please improve it to reduce latency further."
-    )
+    if context == "rich" and cheap_stats:
+        stats_json = json.dumps(cheap_stats, indent=2)
+        feedback_text = (
+            f"This scheduler achieved a median weighted latency of {cheap_latency:.2f}s "
+            f"under a coarser simulation ({sim_label}).\n\n"
+            f"Simulation statistics:\n{stats_json}\n\n"
+            f"Please improve it to reduce latency further."
+        )
+    else:
+        feedback_text = (
+            f"This scheduler achieved a median weighted latency of {cheap_latency:.2f}s. "
+            f"Please improve it to reduce latency further."
+        )
     feedback_history = [{"policy_code": source_code, "feedback": feedback_text}]
 
     gen_start = time.time()
     try:
         result = generate_policy(
-            user_request=get_user_request_v2(policy_key),
+            user_request=get_user_request(policy_key, "weighted latency"),
             feedback_history=feedback_history,
             model=model,
             temperature=1.0,
@@ -299,6 +271,7 @@ def generate_two_shot_perf_scheduler(
     header = "\n".join([
         f"# policy_key: {policy_key}",
         f"# sim_label: {sim_label}",
+        f"# context: {context}",
         f"# model: {model}",
         f"# llm_cost: {cost:.6f}",
         f"# generation_seconds: {secs:.2f}",
@@ -311,28 +284,53 @@ def generate_two_shot_perf_scheduler(
 
 
 def _run_two_shot_perf(args) -> None:
-    """Generate schedulers for exp05: two-shot with varied sim fidelity."""
+    """Generate schedulers for exp05: two-shot with varied sim fidelity.
+
+    Requires analyze.py 05_two_shot_perf source --source <source> to be run first.
+    """
     assert args.sim_label in TWO_SHOT_PERF_CONDITIONS, (
         f"Unknown sim_label '{args.sim_label}'. Choices: {list(TWO_SHOT_PERF_CONDITIONS)}"
     )
-    sim_overrides = TWO_SHOT_PERF_CONDITIONS[args.sim_label]
+    assert args.sim_label != "dur3600_ticks100", (
+        "dur3600_ticks100 is full fidelity (same as exp01); no need to run exp05 for it."
+    )
 
-    source_record, source_path = _select_source_scheduler("median")
+    # Read source info and cheap stats produced by analyze.py phase 'source'
+    source_stats_dir = RESULTS_DIR / "05_two_shot_perf" / "source" / args.source
+    source_info_path = source_stats_dir / "source_info.json"
+    assert source_info_path.exists(), (
+        f"Source stats not found. Run first:\n"
+        f"  python analyze.py 05_two_shot_perf source --source {args.source}"
+    )
+    cheap_stats_path = source_stats_dir / f"{args.sim_label}.json"
+    assert cheap_stats_path.exists(), (
+        f"No cheap stats for {args.sim_label}. Run first:\n"
+        f"  python analyze.py 05_two_shot_perf source --source {args.source}"
+    )
+
+    source_info = json.loads(source_info_path.read_text())
+    cheap_stats = json.loads(cheap_stats_path.read_text())
+    cheap_latency = cheap_stats.get("median_latency", float("inf"))
+
+    source_filename = source_info["filename"]
+    source_median_latency = source_info["full_sim_median_latency"]
+    source_path = SCHEDULERS_DIR / "reasoning" / "low" / source_filename
+    assert source_path.exists(), f"Source scheduler not found: {source_path}"
     source_code = source_path.read_text()
-    key_match = re.search(r"""@register_scheduler\((?:key=)?['"]([^'"]+)['"]\)""", source_code)
-    assert key_match, "No scheduler key in source code"
 
-    print(f"Source: {source_path.name}  sim_label={args.sim_label}")
-    print("Running source simulation for cheap latency...")
-    cheap_latency = _get_source_latency_cheap(source_code, key_match.group(1), sim_overrides)
-    print(f"  cheap_latency={cheap_latency:.4f}")
+    print(f"Source: {source_filename}  full-sim latency={source_median_latency:.4f}")
+    print(f"Cheap sim ({args.sim_label}): median_latency={cheap_latency:.4f}")
+    print(f"context={args.context}  n={args.n}  model={args.model}")
 
-    output_dir = SCHEDULERS_DIR / "two_shot_perf" / args.sim_label
+    output_dir = SCHEDULERS_DIR / "two_shot_perf" / f"{args.source}_{args.context}" / args.sim_label
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "meta.json").write_text(json.dumps({
+        "source": args.source,
+        "context": args.context,
         "sim_label": args.sim_label,
-        "sim_overrides": sim_overrides,
-        "source_filename": source_path.name,
+        "sim_overrides": TWO_SHOT_PERF_CONDITIONS[args.sim_label],
+        "source_filename": source_filename,
+        "source_median_latency": source_median_latency,
         "source_cheap_latency": cheap_latency,
         "model": args.model,
         "n": args.n,
@@ -348,10 +346,12 @@ def _run_two_shot_perf(args) -> None:
             source_code=source_code,
             cheap_latency=cheap_latency,
             sim_label=args.sim_label,
-            policy_key=f"scheduler_perf_{args.sim_label}_{i:03d}",
+            policy_key=f"scheduler_perf_{args.source}_{args.context}_{args.sim_label}_{i:03d}",
             output_dir=output_dir,
             model=args.model,
             verbose=args.verbose,
+            context=args.context,
+            cheap_stats=cheap_stats,
         )
         if p:
             generated.append(p)

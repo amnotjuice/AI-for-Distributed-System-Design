@@ -706,39 +706,127 @@ def analyze_04_two_iter_all(prototype: bool) -> None:
     print(f"Output: {output_path}")
 
 
-def analyze_05_two_shot_perf(prototype: bool, workers: int = 1) -> None:
-    """Fig 5: two-shot perf with shorter/coarser simulations."""
-    base_params = get_canonical_base_params(prototype=prototype)
-    canonical = TRACES_DIR / "bench_canonical_train.csv"
-    assert canonical.exists(), f"Canonical trace not found: {canonical}"
-    trace_files = [str(canonical)]
-    base_params["_cluster_sizes"] = [1, 2, 4, 8, 16]
-
-    # Source latency (full sim) from exp01/low — reuse existing analysis
+def _select_source_for_05(source: str) -> tuple[dict, Path]:
+    """Select best/worst/median scheduler from exp01/low for exp05."""
     analysis_01 = RESULTS_DIR / "01_reasoning" / "low" / "analysis.jsonl"
     assert analysis_01.exists(), "Run analyze.py 01_reasoning first"
     src_pool = [r for r in load_existing_records(analysis_01).values()
                 if r.get("functional") and r.get("median_latency") is not None]
     assert src_pool, "No functional schedulers in 01_reasoning/low"
-    med_val = statistics.median(r["median_latency"] for r in src_pool)
-    source_record = min(src_pool, key=lambda r: abs(r["median_latency"] - med_val))
-    print(f"Source: {source_record['filename']}  full-sim latency={source_record['median_latency']:.4f}")
 
-    out_base = RESULTS_DIR / "05_two_shot_perf"
-    out_base.mkdir(parents=True, exist_ok=True)
-    (out_base / "source.json").write_text(json.dumps({
-        "filename": source_record["filename"],
-        "full_sim_median_latency": source_record["median_latency"],
+    def _gmean(r: dict) -> float:
+        finite = [v for v in r.get("metric_values", []) if v != float("inf") and v > 0]
+        return statistics.geometric_mean(finite) if finite else float("inf")
+
+    if source == "best":
+        record = min(src_pool, key=_gmean)
+    elif source == "worst":
+        record = max(src_pool, key=_gmean)
+    else:  # median
+        med_val = statistics.median(_gmean(r) for r in src_pool)
+        record = min(src_pool, key=lambda r: abs(_gmean(r) - med_val))
+
+    path = SCHEDULERS_DIR / "reasoning" / "low" / record["filename"]
+    assert path.exists(), f"Scheduler file not found: {path}"
+    return record, path
+
+
+def _analyze_05_source(prototype: bool, source: str) -> None:
+    """Phase 'source': run source scheduler under each cheap sim condition, save rich stats."""
+    record, path = _select_source_for_05(source)
+    print(f"Source: {path.name}  full-sim latency={record['median_latency']:.4f}")
+
+    base_params = get_canonical_base_params(prototype=prototype)
+    base_params["_cluster_sizes"] = [1, 2, 4, 8, 16]
+    canonical = str(TRACES_DIR / "bench_canonical_train.csv")
+
+    out_dir = RESULTS_DIR / "05_two_shot_perf" / "source" / source
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "source_info.json").write_text(json.dumps({
+        "source": source,
+        "filename": record["filename"],
+        "full_sim_median_latency": record["median_latency"],
     }, indent=2))
 
-    for label in TWO_SHOT_PERF_CONDITIONS:
-        sched_dir = SCHEDULERS_DIR / "two_shot_perf" / label
-        if not sched_dir.exists() or not list(sched_dir.glob("scheduler_*.py")):
-            print(f"  SKIP {label}: no schedulers")
+    for label, overrides in TWO_SHOT_PERF_CONDITIONS.items():
+        if label == "dur3600_ticks100":
+            continue  # full fidelity = same as exp01, skip
+        out_file = out_dir / f"{label}.json"
+        if out_file.exists():
+            print(f"  SKIP {label}: already exists")
             continue
+        cheap_params = base_params.copy()
+        cheap_params.update(overrides)
+        print(f"\n--- {label} (duration={overrides.get('duration')}, ticks={overrides.get('ticks_per_second')}) ---")
+        result = evaluate(path, [canonical], 0.0, "latency", cheap_params)
+        result["sim_label"] = label
+        result["sim_overrides"] = overrides
+        out_file.write_text(json.dumps(result, indent=2))
+        status = "OK" if result.get("functional") else f"FAIL ({result.get('failure_mode')})"
+        print(f"  {status}  median_latency={result.get('median_latency', 'N/A')}")
+
+
+def _analyze_05_eval(prototype: bool, source: str, context: str, workers: int) -> None:
+    """Phase 'eval': evaluate generated schedulers under full sim, compute improved_rate."""
+    source_info_path = RESULTS_DIR / "05_two_shot_perf" / "source" / source / "source_info.json"
+    assert source_info_path.exists(), (
+        f"Run 'analyze.py 05_two_shot_perf source --source {source}' first"
+    )
+    source_info = json.loads(source_info_path.read_text())
+    source_latency = source_info["full_sim_median_latency"]
+    print(f"Source: {source_info['filename']}  full-sim latency={source_latency:.4f}")
+
+    base_params = get_canonical_base_params(prototype=prototype)
+    base_params["_cluster_sizes"] = [1, 2, 4, 8, 16]
+    canonical = str(TRACES_DIR / "bench_canonical_train.csv")
+    combo = f"{source}_{context}"
+
+    for label in TWO_SHOT_PERF_CONDITIONS:
+        if label == "dur3600_ticks100":
+            continue
+        sched_dir = SCHEDULERS_DIR / "two_shot_perf" / combo / label
+        if not sched_dir.exists() or not list(sched_dir.glob("scheduler_*.py")):
+            print(f"  SKIP {label}: no schedulers in {sched_dir}")
+            continue
+
+        out_dir = RESULTS_DIR / "05_two_shot_perf" / combo / label
         print(f"\n--- {label} ---")
-        run_analyze([sched_dir], trace_files, out_base / label, base_params.copy(),
-                    exp_label=f"two_shot_perf={label}", workers=workers)
+        run_analyze([sched_dir], [canonical], out_dir, base_params.copy(),
+                    exp_label=f"two_shot_perf={combo}/{label}", workers=workers)
+
+        records = list(load_existing_records(out_dir / "analysis.jsonl").values())
+        n_total = len(records)
+        n_functional = sum(1 for r in records if r.get("functional"))
+        n_improved = sum(
+            1 for r in records
+            if r.get("functional") and r.get("median_latency") is not None
+            and r["median_latency"] < source_latency
+        )
+        lo, hi = wilson_interval(n_improved, n_total) if n_total > 0 else (None, None)
+        summary = {
+            "source": source, "context": context, "sim_label": label,
+            "source_median_latency": source_latency,
+            "n_total": n_total, "n_functional": n_functional, "n_improved": n_improved,
+            "improved_rate": n_improved / n_total if n_total > 0 else None,
+            "improved_lo": lo, "improved_hi": hi,
+        }
+        (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
+        rate_str = f"{summary['improved_rate']:.1%}" if summary["improved_rate"] is not None else "N/A"
+        print(f"  Summary: {n_improved}/{n_total} improved ({rate_str})")
+
+
+def analyze_05_two_shot_perf(
+    prototype: bool,
+    phase: str = "all",
+    source: str = "worst",
+    context: str = "rich",
+    workers: int = 1,
+) -> None:
+    """Fig 5: two-shot perf with shorter/coarser simulations."""
+    if phase in ("source", "all"):
+        _analyze_05_source(prototype, source)
+    if phase in ("eval", "all"):
+        _analyze_05_eval(prototype, source, context, workers)
 
 
 def analyze_06_multi_iter(prototype: bool, dry_run: bool = False) -> None:
@@ -884,9 +972,9 @@ def main() -> None:
         "phase",
         nargs="?",
         default="all",
-        choices=["all", "latency", "probe"],
-        help="Phase to run: 'latency', 'probe', or 'all' (default: all). "
-             "Only applies to experiments that support it (01_reasoning, 02_estimation).",
+        choices=["all", "latency", "probe", "source", "eval"],
+        help="Phase to run. 'latency'/'probe' for 01/02. 'source'/'eval' for 05_two_shot_perf. "
+             "'all' runs everything (default).",
     )
     parser.add_argument(
         "--prototype", action="store_true",
@@ -899,6 +987,14 @@ def main() -> None:
     parser.add_argument(
         "--dry-run", action="store_true",
         help="Skip LLM/simulator calls; use fake data. Only applies to experiments that support it.",
+    )
+    parser.add_argument(
+        "--source", default="worst", choices=["best", "worst", "median"],
+        help="Source scheduler type for 05_two_shot_perf (default: worst).",
+    )
+    parser.add_argument(
+        "--context", default="rich", choices=["simple", "rich"],
+        help="Feedback context for 05_two_shot_perf eval phase (default: rich).",
     )
     args = parser.parse_args()
 
@@ -920,6 +1016,10 @@ def main() -> None:
             kwargs["dry_run"] = args.dry_run
         if "phase" in sig:
             kwargs["phase"] = args.phase
+        if "source" in sig:
+            kwargs["source"] = args.source
+        if "context" in sig:
+            kwargs["context"] = args.context
         handler(**kwargs)
 
 

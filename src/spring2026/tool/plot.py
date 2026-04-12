@@ -47,19 +47,17 @@ EFFORT_ORDER  = ["none", "low", "medium", "high"]
 EFFORT_SCORE  = {"none": 0.0, "low": 0.3, "medium": 0.6, "high": 1.0}
 EFFORT_COLORS = {"none": "#c6dbef", "low": "#6baed6", "medium": "#2171b5", "high": "#08306b"}
 
-SIGMA_ORDER  = ["no_estimation", "sigma_0.0", "sigma_0.5", "sigma_1.0", "sigma_1.5"]
+SIGMA_ORDER  = ["no_estimation", "sigma_0.0", "sigma_0.75", "sigma_1.5"]
 SIGMA_LABELS = {
     "no_estimation": "No Est.",
     "sigma_0.0":     "σ=0.0",
-    "sigma_0.5":     "σ=0.5",
-    "sigma_1.0":     "σ=1.0",
+    "sigma_0.75":    "σ=0.75",
     "sigma_1.5":     "σ=1.5",
 }
 SIGMA_COLORS = {
     "no_estimation": "#bdbdbd",
     "sigma_0.0":     "#fdd49e",
-    "sigma_0.5":     "#fc8d59",
-    "sigma_1.0":     "#e34a33",
+    "sigma_0.75":    "#fc8d59",
     "sigma_1.5":     "#b30000",
 }
 
@@ -78,16 +76,16 @@ PROBE_LABELS = {
 
 
 def apply_plot_style() -> None:
-    plt.style.use("seaborn-v0_8-whitegrid")
+    plt.style.use("seaborn-v0_8-white")
     plt.rcParams.update({
         "figure.facecolor": "white",
-        "axes.facecolor": "#fbfcfe",
+        "axes.facecolor": "white",
         "axes.edgecolor": "#d8e0e8",
         "axes.labelcolor": "#25364a",
         "axes.titleweight": "semibold",
         "xtick.color": "#3b4d5f",
         "ytick.color": "#3b4d5f",
-        "grid.color": "#d9e2ec",
+        "axes.grid": False,
         "font.size": 11,
     })
 
@@ -114,7 +112,7 @@ def _gradient_colors(labels: list[str], cmap_name: str = "YlGnBu") -> list[str]:
 def _style_axes(ax: plt.Axes) -> None:
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
-    ax.grid(axis="y", alpha=0.35, linewidth=0.8)
+    ax.grid(False)
     ax.set_axisbelow(True)
 
 
@@ -215,6 +213,8 @@ def _draw_probe_pass_rates(ax: plt.Axes, data: dict[str, dict[str, float]], bar_
     probes = list(PROBE_LABELS.keys())
     efforts = [e for e in EFFORT_ORDER if e in data]
     n = len(efforts)
+    if n == 0:
+        return
     bar_width = bar_width_total / n
     centers = np.arange(len(probes))
 
@@ -229,7 +229,7 @@ def _draw_probe_pass_rates(ax: plt.Axes, data: dict[str, dict[str, float]], bar_
     ax.set_ylabel("% Passing", fontsize=5)
     ax.tick_params(axis="y", labelsize=5)
     ax.set_ylim(0, 100)
-    ax.yaxis.grid(True, linewidth=0.4, color="#dddddd", zorder=1)
+    ax.yaxis.grid(False)
     ax.set_axisbelow(True)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
@@ -247,7 +247,7 @@ def _draw_latency_cdf_by_effort(ax: plt.Axes, data: dict[str, np.ndarray]) -> No
     ax.set_ylabel("% of Schedulers", fontsize=5)
     ax.tick_params(axis="both", labelsize=5)
     ax.set_ylim(0, 100)
-    ax.yaxis.grid(True, linewidth=0.4, color="#dddddd", zorder=1)
+    ax.yaxis.grid(False)
     ax.set_axisbelow(True)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
@@ -307,7 +307,7 @@ def _draw_probe_pass_rates_single(ax: plt.Axes, rates: dict[str, float]) -> None
     ax.set_ylabel("% Passing", fontsize=5)
     ax.tick_params(axis="y", labelsize=5)
     ax.set_ylim(0, 100)
-    ax.yaxis.grid(True, linewidth=0.4, color="#dddddd", zorder=1)
+    ax.yaxis.grid(False)
     ax.set_axisbelow(True)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
@@ -325,7 +325,7 @@ def _draw_latency_cdf_by_sigma(ax: plt.Axes, data: dict[str, np.ndarray]) -> Non
     ax.set_ylabel("% of Schedulers", fontsize=5)
     ax.tick_params(axis="both", labelsize=5)
     ax.set_ylim(0, 100)
-    ax.yaxis.grid(True, linewidth=0.4, color="#dddddd", zorder=1)
+    ax.yaxis.grid(False)
     ax.set_axisbelow(True)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
@@ -425,8 +425,8 @@ def _plot_latency_cdf(grouped: dict[str, list[dict]], output_path: Path, title: 
 # Fig 3 helpers
 # ---------------------------------------------------------------------------
 
-SOURCE_ORDER   = ["best", "worst", "median"]
-SOURCE_COLORS  = {"best": "#2ca02c", "worst": "#d62728", "median": "#1f77b4"}
+SOURCE_ORDER   = ["worst", "median", "best"]
+SOURCE_COLORS  = {"best": "#10b981", "worst": "#ef4444", "median": "#3b82f6"}  # Modern vibrant palette
 CONTEXT_HATCH  = {"simple": "", "rich": "///"}
 CONTEXT_LABELS = {"simple": "Simple context", "rich": "Rich context"}
 
@@ -510,7 +510,7 @@ def plot_03_two_iter_best_worst() -> None:
         print("  No results yet for 03_two_iter — run analyze.py 03_two_iter_best_worst first")
         return
 
-    fig, ax = plt.subplots(figsize=(4.5, 2.5))
+    fig, ax = plt.subplots(figsize=(3.5, 2.2))
 
     bar_width = 0.28
     group_gap = 0.75
@@ -543,17 +543,19 @@ def plot_03_two_iter_best_worst() -> None:
     # Group tick labels
     centers = [i * group_gap + (len(contexts) - 1) * bar_width / 2 for i in range(len(SOURCE_ORDER))]
     ax.set_xticks(centers)
-    ax.set_xticklabels([s.capitalize() for s in SOURCE_ORDER], fontsize=7)
+    ax.set_xticklabels([s.capitalize() for s in SOURCE_ORDER], fontsize=7, fontweight="medium")
     ax.set_ylabel("% Improved Over Source", fontsize=7)
-    ax.set_title("(a) Two-Iteration Improvement Rate", fontsize=8)
+    ax.set_title("Two-Iteration Improvement Rate", fontsize=8, pad=8)
     ax.set_ylim(0, 100)
     ax.tick_params(axis="y", labelsize=6)
 
+    # Simplified legend just for contexts
     handles = [
         Patch(facecolor="#aaaaaa", hatch="",    edgecolor="#555555", label="Simple context"),
         Patch(facecolor="#aaaaaa", hatch="///", edgecolor="#555555", label="Rich context"),
     ]
-    ax.legend(handles=handles, frameon=False, fontsize=5, loc="upper right")
+    ax.legend(handles=handles, frameon=False, fontsize=5.5, loc="upper right")
+    
     _style_axes(ax)
     _save(fig, PLOTS_DIR / "03_two_iter" / "fig3")
 
@@ -631,34 +633,41 @@ def plot_04_two_iter_all() -> None:
     _save(fig, PLOTS_DIR / "04_two_iter_all" / "fig4")
 
 
-def plot_05_two_shot_perf() -> None:
+def plot_05_two_shot_perf(source: str = "worst", context: str = "rich") -> None:
     """Fig 5: beat-source rate vs sim fidelity (shorter duration / coarser ticks)."""
     out_base = RESULTS_DIR / "05_two_shot_perf"
-    source_path = out_base / "source.json"
-    if not source_path.exists():
-        print("  No results yet for 05_two_shot_perf — run analyze.py 05_two_shot_perf first")
+    combo = f"{source}_{context}"
+    source_info_path = out_base / "source" / source / "source_info.json"
+    if not source_info_path.exists():
+        print(f"  No source info — run: analyze.py 05_two_shot_perf source --source {source}")
         return
 
-    source_latency = json.loads(source_path.read_text())["full_sim_median_latency"]
+    source_latency = json.loads(source_info_path.read_text())["full_sim_median_latency"]
 
     labels, rates, errs, colors = [], [], [], []
     for label, cond in TWO_SHOT_PERF_CONDITIONS.items():
-        records = load_jsonl(out_base / label / "analysis.jsonl")
+        if label == "dur3600_ticks100":
+            # Full-fidelity baseline: read from exp03 two_iter results
+            records = load_jsonl(RESULTS_DIR / "03_two_iter" / combo / "analysis.jsonl")
+        else:
+            records = load_jsonl(out_base / combo / label / "analysis.jsonl")
         functional = [r for r in records
                       if r.get("functional") and r.get("median_latency") is not None]
         if not functional:
             continue
-        n = len(functional)
+        n = len(records)  # all records (non-functional count as not improved)
         beats = sum(1 for r in functional if r["median_latency"] < source_latency)
         lo, hi = wilson_interval(beats, n)
-        labels.append(label.replace("dur", "d=").replace("_ticks", "\nt="))
+        labels.append("d=3600\nt=100" if label == "dur3600_ticks100"
+                       else label.replace("dur", "d=").replace("_ticks", "\nt="))
         rates.append(beats / n * 100)
         errs.append([(beats / n - lo) * 100, (hi - beats / n) * 100])
-        # blue = ticks vary (duration fixed at 3600), orange = duration varies
-        colors.append("#2171b5" if cond["duration"] == 3600 else "#e6550d")
+        # grey = full fidelity baseline, blue = ticks vary, orange = duration varies
+        colors.append("#888888" if label == "dur3600_ticks100"
+                      else "#2171b5" if cond["duration"] == 3600 else "#e6550d")
 
     if not labels:
-        print("  No results yet for 05_two_shot_perf")
+        print(f"  No results yet for 05_two_shot_perf/{combo}")
         return
 
     x = np.arange(len(labels))
@@ -675,6 +684,7 @@ def plot_05_two_shot_perf() -> None:
     ax.set_title("Two-Shot Improvement Rate by Sim Fidelity", fontsize=10)
     ax.set_ylim(0, 100)
     ax.legend(handles=[
+        Patch(facecolor="#888888", label="Full fidelity"),
         Patch(facecolor="#e6550d", label="Shorter duration"),
         Patch(facecolor="#2171b5", label="Coarser ticks"),
     ], frameon=False, fontsize=7)
@@ -753,15 +763,25 @@ def main() -> None:
         choices=list(PLOT_HANDLERS) + ["all"],
         help="Experiment to plot, or 'all'",
     )
+    parser.add_argument("--source", default="worst", choices=["best", "worst", "median"])
+    parser.add_argument("--context", default="rich", choices=["simple", "rich"])
     args = parser.parse_args()
 
+    import inspect
     apply_plot_style()
     exps = list(PLOT_HANDLERS) if args.experiment == "all" else [args.experiment]
     for exp in exps:
         print(f"\n{'='*60}")
         print(f"Plot: {exp} — {EXPERIMENTS.get(exp, '')}")
         print("=" * 60)
-        PLOT_HANDLERS[exp]()
+        handler = PLOT_HANDLERS[exp]
+        sig = inspect.signature(handler).parameters
+        kwargs: dict = {}
+        if "source" in sig:
+            kwargs["source"] = args.source
+        if "context" in sig:
+            kwargs["context"] = args.context
+        handler(**kwargs)
 
     print(f"\nDONE. PDFs in {PLOTS_DIR}/")
 
