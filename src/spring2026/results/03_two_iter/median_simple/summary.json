@@ -1,0 +1,13 @@
+{
+  "combo": "median_simple",
+  "source": "median",
+  "context": "simple",
+  "source_filename": "scheduler_low_019.py",
+  "source_median_latency": 300.1278985285101,
+  "n_total": 20,
+  "n_functional": 4,
+  "n_improved": 0,
+  "improved_rate": 0.0,
+  "improved_lo": 0.0,
+  "improved_hi": 0.1611301254949332
+}

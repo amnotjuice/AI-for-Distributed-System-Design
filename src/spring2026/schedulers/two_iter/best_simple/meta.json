@@ -1,0 +1,8 @@
+{
+  "source": "best",
+  "context": "simple",
+  "source_filename": "scheduler_low_037.py",
+  "source_median_latency": 162.25810698957693,
+  "model": "gpt-5.2-2025-12-11",
+  "n": 20
+}
