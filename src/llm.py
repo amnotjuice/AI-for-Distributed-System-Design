@@ -41,7 +41,7 @@ def build_system_context(files=[], sections={}):
 
     for filename in files:
         filepath = markdown_dir / filename
-        with open(filepath, "r") as f:
+        with open(filepath, "r", encoding="utf-8") as f:
             content = f.read()
             context_parts.append(f"# {filename}\n{content}")
 
