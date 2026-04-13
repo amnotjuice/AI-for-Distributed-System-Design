@@ -10,14 +10,14 @@ Usage:
 Each scheduler is evaluated in an isolated subprocess with a timeout so that
 stuck or infinitely-looping schedulers do not block the run.
 
-Dimensions used for Pareto dominance (default):
-    - latency_query_s       (minimize)
-    - latency_interactive_s (minimize)
-    - latency_batch_s       (minimize)
-    - probe_score           (maximize)
+Dimensions used for Pareto dominance (matches Fig 2 metrics):
+    - probe_syntax, probe_valid_scheduler, probe_basic_run, probe_retry_run,
+      probe_suspend_run, probe_grouping, probe_overcommit, probe_priority_ordering,
+      probe_starvation, probe_no_deadlock  (each maximize, binary 0/1)
+    - adjusted_latency  (minimize — SimulatorStats.adjusted_latency() median)
 
 With --hard-probes: only schedulers passing all probes are considered,
-Pareto is then over the 3 latency dims only.
+Pareto is then over adjusted_latency only.
 
 Results saved to results/pareto/<scheduler_dir_name>/
 """
@@ -40,8 +40,8 @@ from pathlib import Path
 # Path setup
 # ---------------------------------------------------------------------------
 
-_HERE  = Path(__file__).resolve().parent   # src/spring2026/
-_SRC   = _HERE.parent                      # src/
+_HERE  = Path(__file__).resolve().parent.parent   # src/spring2026/
+_SRC   = _HERE.parent                             # src/
 _TOOL  = _HERE / "tool"
 _PROBE = _TOOL / "probe"
 
@@ -74,9 +74,16 @@ def _worker_main(argv: list[str]) -> int:
     from run_probes import run_all_probes
 
     # ── probes ────────────────────────────────────────────────────────────
+    PROBE_NAMES = [
+        "syntax", "valid_scheduler", "basic_run", "retry_run", "suspend_run",
+        "grouping", "overcommit", "priority_ordering", "starvation", "no_deadlock",
+    ]
     probe_results = run_all_probes(scheduler_file, base_params, traces)
     probe_score   = sum(1 for v in probe_results.values() if v.get("functional"))
     probe_total   = len(probe_results)
+    # Individual binary pass/fail per probe (1=pass, 0=fail/missing)
+    probe_binary  = {f"probe_{p}": int(probe_results.get(p, {}).get("functional", False))
+                     for p in PROBE_NAMES}
 
     # ── latency ───────────────────────────────────────────────────────────
     src = scheduler_file.read_text()
@@ -139,15 +146,17 @@ def _worker_main(argv: list[str]) -> int:
             comp = sum(getattr(s, attr).completion_count for s in raw if hasattr(s, attr))
             return comp / arr if arr > 0 else None
 
+        adj_vals = extract_metrics_from_stats(raw, "latency")
         result = {
             "ok":                    True,
             "probe_score":           probe_score,
             "probe_total":           probe_total,
+            **probe_binary,
             "latency_query_s":       _wm("pipelines_query"),
             "latency_interactive_s": _wm("pipelines_interactive"),
             "latency_batch_s":       _wm("pipelines_batch"),
             "completion_rate":       _cr("pipelines_all") if hasattr(raw[0], "pipelines_all") else None,
-            "median_latency":        statistics.median(extract_metrics_from_stats(raw, "latency")),
+            "adjusted_latency":      statistics.median(adj_vals) if adj_vals else None,
         }
     except Exception as e:
         result = {
@@ -241,6 +250,8 @@ def main() -> None:
                         help="Per-scheduler timeout in seconds (default: 120 prototype, 600 full)")
     parser.add_argument("--trace",       type=str, default=None,
                         help="Override trace file")
+    parser.add_argument("--out-dir",     type=str, default=None,
+                        help="Override output directory (default: results/pareto/<group>)")
     args = parser.parse_args()
 
     from config import get_canonical_base_params, TRACES_DIR, RESULTS_DIR
@@ -253,12 +264,15 @@ def main() -> None:
 
     base_params = get_canonical_base_params(prototype=args.prototype)
     timeout_s   = args.timeout or (120 if args.prototype else 600)
-    trace_file  = args.trace or str(TRACES_DIR / "bench_canonical_train.csv")
+    trace_file  = str(Path(args.trace).resolve()) if args.trace else str(TRACES_DIR / "bench_canonical_train.csv")
 
     if not Path(trace_file).exists():
         print(f"Trace not found: {trace_file}\nRun:  python traces/generate.py"); sys.exit(1)
 
-    out_dir = RESULTS_DIR / "pareto" / sched_dir.name
+    if args.out_dir:
+        out_dir = Path(args.out_dir) / sched_dir.name
+    else:
+        out_dir = RESULTS_DIR / "pareto" / sched_dir.name
     out_dir.mkdir(parents=True, exist_ok=True)
 
     n         = len(scheduler_files)
@@ -286,9 +300,9 @@ def main() -> None:
     if existing:
         print(f"Resuming: {len(existing)} already recorded.\n")
 
-    print(f"{'─'*78}")
+    print("-" * 78)
     print(f"{'Scheduler':<32} {'Status':>10} {'Q-lat':>8} {'R-lat':>8} {'B-lat':>8} {'Probes':>7} {'Elapsed':>8}")
-    print(f"{'─'*78}")
+    print("-" * 78)
 
     all_records: list[dict] = list(existing.values())
 
@@ -326,19 +340,25 @@ def main() -> None:
 
     # ── Pareto ───────────────────────────────────────────────────────────────
     functional = [r for r in all_records if r.get("ok")]
-    print(f"\n{'─'*70}")
+    print("\n" + "-" * 70)
     print(f"{len(functional)}/{len(all_records)} schedulers produced valid latency data.")
+
+    PROBE_DIMS = [
+        ("probe_syntax","max"), ("probe_valid_scheduler","max"), ("probe_basic_run","max"),
+        ("probe_retry_run","max"), ("probe_suspend_run","max"), ("probe_grouping","max"),
+        ("probe_overcommit","max"), ("probe_priority_ordering","max"),
+        ("probe_starvation","max"), ("probe_no_deadlock","max"),
+    ]
 
     if args.hard_probes:
         candidates = [r for r in functional if r.get("probe_score", 0) == r.get("probe_total", 10)]
         print(f"{len(candidates)} pass all probes (--hard-probes mode).")
-        dims = [("latency_query_s","min"), ("latency_interactive_s","min"), ("latency_batch_s","min")]
-        dim_label = "latency_q × latency_r × latency_b"
+        dims = [("adjusted_latency", "min")]
+        dim_label = "adjusted_latency"
     else:
         candidates = functional
-        dims = [("latency_query_s","min"), ("latency_interactive_s","min"),
-                ("latency_batch_s","min"), ("probe_score","max")]
-        dim_label = "latency_q × latency_r × latency_b × probe_score"
+        dims = PROBE_DIMS + [("adjusted_latency", "min")]
+        dim_label = "probe_* (10 binary) × adjusted_latency"
 
     if not candidates:
         print("No candidates for Pareto analysis."); return
@@ -346,32 +366,65 @@ def main() -> None:
     pareto = compute_pareto(candidates, dims)
     pareto.sort(key=lambda r: r.get("latency_query_s") or float("inf"))
 
-    print(f"\n{'='*70}")
-    print(f"PARETO-OPTIMAL SCHEDULERS  —  {len(pareto)} of {len(candidates)} candidates")
-    print(f"Objective space: {dim_label}")
-    print(f"{'='*70}")
-    print(f"{'Scheduler':<32} {'Q-lat':>8} {'R-lat':>8} {'B-lat':>8} {'Probes':>8}")
-    print(f"{'─'*70}")
+    # ── Unique Pareto: deduplicate on identical objective vectors ─────────────
+    PROBE_NAMES_LIST = [
+        "probe_syntax", "probe_valid_scheduler", "probe_basic_run", "probe_retry_run",
+        "probe_suspend_run", "probe_grouping", "probe_overcommit", "probe_priority_ordering",
+        "probe_starvation", "probe_no_deadlock",
+    ]
+    def _obj_key(r):
+        probes = tuple(r.get(p, 0) for p in PROBE_NAMES_LIST)
+        al = round(r.get("adjusted_latency") or 0, 1)
+        return probes + (al,)
+
+    seen_keys = set()
+    unique_pareto = []
     for r in pareto:
-        lq = f"{r['latency_query_s']:.1f}s"       if r.get("latency_query_s")       is not None else "—"
-        lr = f"{r['latency_interactive_s']:.1f}s" if r.get("latency_interactive_s") is not None else "—"
-        lb = f"{r['latency_batch_s']:.1f}s"       if r.get("latency_batch_s")        is not None else "—"
+        k = _obj_key(r)
+        if k not in seen_keys:
+            seen_keys.add(k)
+            unique_pareto.append(r)
+
+    pct_pareto = 100.0 * len(pareto) / len(candidates) if candidates else 0.0
+    pct_unique = 100.0 * len(unique_pareto) / len(candidates) if candidates else 0.0
+    print("\n" + "=" * 78)
+    print(f"PARETO-OPTIMAL SCHEDULERS  --  {len(pareto)} total  ({pct_pareto:.1f}%)  |  {len(unique_pareto)} unique  ({pct_unique:.1f}%)")
+    print(f"Objective space: {dim_label}")
+    print("=" * 78)
+    print(f"{'Scheduler':<32} {'Adj-lat':>10} {'Q-lat':>8} {'R-lat':>8} {'B-lat':>8} {'Probes':>7} {'Unique':>7}")
+    print("-" * 78)
+    unique_keys_set = {_obj_key(r) for r in unique_pareto}
+    for r in pareto:
+        al = f"{r['adjusted_latency']:.1f}s"       if r.get("adjusted_latency")       is not None else "-"
+        lq = f"{r['latency_query_s']:.1f}s"        if r.get("latency_query_s")        is not None else "-"
+        lr = f"{r['latency_interactive_s']:.1f}s"  if r.get("latency_interactive_s")  is not None else "-"
+        lb = f"{r['latency_batch_s']:.1f}s"        if r.get("latency_batch_s")        is not None else "-"
         ps = f"{r.get('probe_score',0)}/{r.get('probe_total',10)}"
-        print(f"  {r['filename']:<30} {lq:>8} {lr:>8} {lb:>8} {ps:>8}")
+        is_unique = "yes" if _obj_key(r) in unique_keys_set else "dup"
+        unique_keys_set.discard(_obj_key(r))  # only mark first occurrence as unique
+        print(f"  {r['filename']:<30} {al:>10} {lq:>8} {lr:>8} {lb:>8} {ps:>7} {is_unique:>7}")
 
     # ── Save Pareto CSV ───────────────────────────────────────────────────────
     pareto_path = out_dir / "pareto.csv"
-    fields = ["filename", "latency_query_s", "latency_interactive_s", "latency_batch_s",
-              "probe_score", "probe_total", "median_latency", "completion_rate"]
+    probe_fields = [
+        "probe_syntax", "probe_valid_scheduler", "probe_basic_run", "probe_retry_run",
+        "probe_suspend_run", "probe_grouping", "probe_overcommit", "probe_priority_ordering",
+        "probe_starvation", "probe_no_deadlock",
+    ]
+    fields = (["filename", "adjusted_latency", "latency_query_s", "latency_interactive_s",
+               "latency_batch_s", "probe_score", "probe_total", "completion_rate"]
+              + probe_fields)
     with pareto_path.open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
         w.writeheader()
         w.writerows(pareto)
 
     total_s = int(time.time() - run_start)
-    print(f"\nRaw results  → {raw_path}")
-    print(f"Pareto table → {pareto_path}")
-    print(f"Total time   → {total_s//3600:02d}:{(total_s%3600)//60:02d}:{total_s%60:02d}")
+    print(f"\nPareto optimal  : {len(pareto)}/{len(candidates)}  ({pct_pareto:.1f}%)")
+    print(f"Unique Pareto   : {len(unique_pareto)}/{len(candidates)}  ({pct_unique:.1f}%)")
+    print(f"Raw results  -> {raw_path}")
+    print(f"Pareto table -> {pareto_path}")
+    print(f"Total time   -> {total_s//3600:02d}:{(total_s%3600)//60:02d}:{total_s%60:02d}")
 
 
 # ---------------------------------------------------------------------------

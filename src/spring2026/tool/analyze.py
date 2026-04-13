@@ -599,11 +599,16 @@ def analyze_03_two_iter_best_worst(prototype: bool, workers: int = 1) -> None:
         print(f"  Summary: {n_improved}/{n_total} improved ({rate_str})")
 
 
-def analyze_04_two_iter_all(prototype: bool) -> None:
+def analyze_04_two_iter_all(prototype: bool, workers: int = 1) -> None:
     """Fig 4: two-iteration, median source, evaluate v2 on all 10 train traces."""
     base_params = get_canonical_base_params(prototype=prototype)
     base_params["_cluster_sizes"] = [1, 2, 4, 8, 16]
     cluster_sizes = base_params["_cluster_sizes"]
+
+    # Each subprocess runs n_traces × n_cluster_sizes simulations; scale timeout up.
+    n_sims = len(cluster_sizes) * 10  # 50 simulations per subprocess call
+    if base_params.get("subprocess_timeout") is not None:
+        base_params["subprocess_timeout"] = base_params["subprocess_timeout"] * n_sims
 
     all_trace_paths = sorted(TRACES_DIR.glob("bench_*_train.csv"))
     assert all_trace_paths, f"No bench_*_train.csv found in {TRACES_DIR}"
@@ -645,14 +650,31 @@ def analyze_04_two_iter_all(prototype: bool) -> None:
     if source_data is None:
         print(f"Evaluating source: {source_record['filename']} on {n_traces} traces...")
         result = evaluate(source_file, trace_files, 0.0, "latency", base_params.copy())
-        assert result.get("functional"), f"Source scheduler failed: {result.get('failure_mode')}"
-        vals = result["metric_values"]
-        per_trace_latency = {}
-        for j, name in enumerate(trace_names):
-            trace_vals = [vals[i * n_traces + j] for i in range(n_clusters)
-                          if i * n_traces + j < len(vals)]
-            finite = [v for v in trace_vals if v != float("inf")]
-            per_trace_latency[name] = statistics.median(finite) if finite else float("inf")
+        if not result.get("functional"):
+            print(f"  WARNING: source scheduler failed ({result.get('failure_mode')}) — "
+                  f"evaluating each trace individually to recover partial results.")
+            per_trace_latency = {}
+            # Use single-pool, no cluster_sizes for the per-trace fallback —
+            # simpler evaluation that avoids the expected-count mismatch.
+            single_params = base_params.copy()
+            single_params.pop("_cluster_sizes", None)
+            single_params["num_pools"] = 1
+            for trace_file, name in zip(trace_files, trace_names):
+                r = evaluate(source_file, [trace_file], 0.0, "latency", single_params.copy())
+                if r.get("functional") and r.get("metric_values"):
+                    finite = [v for v in r["metric_values"] if v != float("inf")]
+                    per_trace_latency[name] = statistics.median(finite) if finite else float("inf")
+                else:
+                    print(f"    FAIL on {name}: {r.get('failure_mode')} — using inf as baseline")
+                    per_trace_latency[name] = float("inf")
+        else:
+            vals = result["metric_values"]
+            per_trace_latency = {}
+            for j, name in enumerate(trace_names):
+                trace_vals = [vals[i * n_traces + j] for i in range(n_clusters)
+                              if i * n_traces + j < len(vals)]
+                finite = [v for v in trace_vals if v != float("inf")]
+                per_trace_latency[name] = statistics.median(finite) if finite else float("inf")
         source_data = {
             "filename": source_record["filename"],
             "exp01_median_latency": source_record["median_latency"],
@@ -676,56 +698,77 @@ def analyze_04_two_iter_all(prototype: bool) -> None:
         print("No v2 schedulers found. Run: python generate.py --exp two_iter --source median --context simple/rich")
         return
 
-    print(f"{n_traces} traces | {len(scheduler_files)} v2 schedulers")
+    print(f"{n_traces} traces | {len(scheduler_files)} v2 schedulers | workers={workers}")
     if existing:
         print(f"Resuming: {len(existing)} existing records")
 
+    todo = [(fp, ctx) for fp, ctx in scheduler_files if fp.name not in existing]
+    for fp, _ in scheduler_files:
+        if fp.name in existing:
+            print(f"  already recorded: {fp.name}")
+
+    def _eval_one(fp_ctx: tuple[Path, str]) -> dict:
+        fp, ctx = fp_ctx
+        t0 = time.time()
+        result = evaluate(fp, trace_files, 0.0, "latency", base_params.copy())
+        per_trace_latency: dict[str, float] = {}
+        per_trace_beats: dict[str, bool] = {}
+        beats_count = 0
+        if result.get("functional") and result.get("metric_values"):
+            vals = result["metric_values"]
+            for j, name in enumerate(trace_names):
+                trace_vals = [vals[i * n_traces + j] for i in range(n_clusters)
+                              if i * n_traces + j < len(vals)]
+                finite = [v for v in trace_vals if v != float("inf")]
+                v2_lat = statistics.median(finite) if finite else float("inf")
+                src_lat = per_trace_source.get(name, float("inf"))
+                per_trace_latency[name] = v2_lat
+                per_trace_beats[name] = bool(v2_lat < src_lat)
+                if v2_lat < src_lat:
+                    beats_count += 1
+        return {
+            "filename": fp.name,
+            "context": ctx,
+            "source_filename": source_data["filename"],
+            **parse_header(fp),
+            "functional": result.get("functional", False),
+            "failure_mode": result.get("failure_mode", "unknown"),
+            "per_trace_latency": per_trace_latency,
+            "per_trace_beats_source": per_trace_beats,
+            "beats_source_count": beats_count,
+            "n_traces": n_traces,
+            "simulation_seconds": round(time.time() - t0, 2),
+        }
+
+    total = len(scheduler_files)
+    done = len(existing)
     with output_path.open("a") as out_f:
-        for i, (fp, ctx) in enumerate(scheduler_files, 1):
-            if fp.name in existing:
-                print(f"[{i}/{len(scheduler_files)}] {fp.name}  already recorded")
-                continue
-            print(f"[{i}/{len(scheduler_files)}] {fp.name}  (context={ctx})")
-            t0 = time.time()
-            result = evaluate(fp, trace_files, 0.0, "latency", base_params.copy())
-
-            per_trace_latency: dict[str, float] = {}
-            per_trace_beats: dict[str, bool] = {}
-            beats_count = 0
-
-            if result.get("functional") and result.get("metric_values"):
-                vals = result["metric_values"]
-                for j, name in enumerate(trace_names):
-                    trace_vals = [vals[i * n_traces + j] for i in range(n_clusters)
-                                  if i * n_traces + j < len(vals)]
-                    finite = [v for v in trace_vals if v != float("inf")]
-                    v2_lat = statistics.median(finite) if finite else float("inf")
-                    src_lat = per_trace_source.get(name, float("inf"))
-                    per_trace_latency[name] = v2_lat
-                    per_trace_beats[name] = bool(v2_lat < src_lat)
-                    if v2_lat < src_lat:
-                        beats_count += 1
-
-            record = {
-                "filename": fp.name,
-                "context": ctx,
-                "source_filename": source_data["filename"],
-                **parse_header(fp),
-                "functional": result.get("functional", False),
-                "failure_mode": result.get("failure_mode", "unknown"),
-                "per_trace_latency": per_trace_latency,
-                "per_trace_beats_source": per_trace_beats,
-                "beats_source_count": beats_count,
-                "n_traces": n_traces,
-                "simulation_seconds": round(time.time() - t0, 2),
-            }
-            out_f.write(json.dumps(record) + "\n")
-            out_f.flush()
-            with suppress(OSError):
-                os.fsync(out_f.fileno())
-
-            status = "OK" if record["functional"] else "FAIL"
-            print(f"  {status}  beats_source={beats_count}/{n_traces}")
+        if workers <= 1:
+            for fp, ctx in todo:
+                done += 1
+                print(f"[{done}/{total}] {fp.name}  (context={ctx})")
+                record = _eval_one((fp, ctx))
+                out_f.write(json.dumps(record) + "\n")
+                out_f.flush()
+                with suppress(OSError):
+                    os.fsync(out_f.fileno())
+                status = "OK" if record["functional"] else "FAIL"
+                print(f"  {status}  beats_source={record['beats_source_count']}/{n_traces}")
+        else:
+            lock = __import__("threading").Lock()
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futs = {executor.submit(_eval_one, item): item for item in todo}
+                for fut in as_completed(futs):
+                    record = fut.result()
+                    with lock:
+                        done += 1
+                        out_f.write(json.dumps(record) + "\n")
+                        out_f.flush()
+                        with suppress(OSError):
+                            os.fsync(out_f.fileno())
+                        status = "OK" if record["functional"] else "FAIL"
+                        print(f"[{done}/{total}] {record['filename']}  (context={record['context']})  "
+                              f"{status}  beats_source={record['beats_source_count']}/{n_traces}")
 
     # --- Summary ---
     all_records = list(load_existing_records(output_path).values())

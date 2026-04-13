@@ -12,12 +12,19 @@ Outputs:
 
 from __future__ import annotations
 
+import argparse
 import csv
 import json
 import math
 from pathlib import Path
 
-RESULTS_DIR = Path(__file__).resolve().parent / "results" / "pareto"
+_parser = argparse.ArgumentParser()
+_parser.add_argument("--results-dir", type=str, default=None,
+                     help="Override results directory (default: results/pareto)")
+_args = _parser.parse_args()
+
+RESULTS_DIR = Path(_args.results_dir).resolve() if _args.results_dir else \
+              Path(__file__).resolve().parent.parent / "results" / "pareto"
 GROUPS      = ["none", "low", "medium", "high"]
 
 # ── helpers ──────────────────────────────────────────────────────────────────
