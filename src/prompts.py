@@ -207,6 +207,9 @@ def get_iteration_feedback_prompt(
     rows = []
     valid_latencies: list[float] = []
     errors: list[str] = []
+    def _lat(v):
+        return f"{v:.2f}s" if v is not None else "n/a"
+
     for scale in sorted(scale_results):
         r = scale_results[scale]
         cpus = base_params["cpus_per_pool"] * scale
@@ -214,7 +217,14 @@ def get_iteration_feedback_prompt(
         if r.get("ok"):
             lat = r["latency"]
             valid_latencies.append(lat)
-            rows.append(f"  {scale:2d}x  ({cpus:5d} CPUs, {ram:6d} GB RAM)  {lat:.4f}s")
+            rows.append(f"  {scale:2d}x  ({cpus:5d} CPUs, {ram:6d} GB RAM)  adj={lat:.4f}s"
+                        f"  failures={r.get('failures', '?')}  suspensions={r.get('suspensions', '?')}")
+            for prio in ("query", "interactive", "batch"):
+                ps = r.get(prio)
+                if ps:
+                    arr, comp = ps["arrived"], ps["completed"]
+                    rows.append(f"       {prio:<13s} {comp:3d}/{arr:3d} completed"
+                                f"  mean={_lat(ps['mean_s'])}  p99={_lat(ps['p99_s'])}")
         else:
             err = r.get("error", "unknown error")
             errors.append(err)

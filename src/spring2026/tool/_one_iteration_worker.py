@@ -67,7 +67,28 @@ def main() -> None:
             stats = run_simulator(params, workload=workload)
         weights = {Priority.QUERY: 10, Priority.INTERACTIVE: 5, Priority.BATCH_PIPELINE: 1}
         latency = stats.adjusted_latency(weights=weights, divide_by_completion_rate=True)
-        print("__RESULT__" + json.dumps({"ok": True, "latency": latency}))
+
+        def _f(v):
+            import math
+            return round(v, 2) if (isinstance(v, float) and math.isfinite(v)) else None
+
+        def _ps(ps):
+            return {
+                "arrived": ps.arrival_count,
+                "completed": ps.completion_count,
+                "mean_s": _f(ps.mean_latency_seconds),
+                "p99_s": _f(ps.p99_latency_seconds),
+            }
+
+        print("__RESULT__" + json.dumps({
+            "ok": True,
+            "latency": latency,
+            "failures": stats.failures,
+            "suspensions": stats.suspensions,
+            "query":       _ps(stats.pipelines_query),
+            "interactive": _ps(stats.pipelines_interactive),
+            "batch":       _ps(stats.pipelines_batch),
+        }))
     except Exception as exc:
         print("__RESULT__" + json.dumps({"ok": False, "error": str(exc)}))
 

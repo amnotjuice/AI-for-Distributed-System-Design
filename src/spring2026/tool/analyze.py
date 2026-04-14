@@ -794,8 +794,8 @@ def analyze_06_multi_iter(prototype: bool, dry_run: bool = False) -> None:
     out_dir = RESULTS_DIR / "06_multi_iter"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    n_scenarios = 2 if prototype else _cfg.N_SCENARIOS
-    n_iterations = 3 if prototype else _cfg.N_ITERATIONS
+    n_scenarios = 1 if prototype else _cfg.N_SCENARIOS
+    n_iterations = 6 if prototype else _cfg.N_ITERATIONS
 
     tag = ("_dryrun" if dry_run else "") + ("_prototype" if prototype else "")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
