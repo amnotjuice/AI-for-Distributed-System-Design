@@ -1,0 +1,12 @@
+{
+  "source": "best",
+  "context": "simple",
+  "sim_label": "dur1800_ticks100",
+  "source_median_latency": 162.25810698957693,
+  "n_total": 20,
+  "n_functional": 9,
+  "n_improved": 6,
+  "improved_rate": 0.3,
+  "improved_lo": 0.14547527396899385,
+  "improved_hi": 0.5189767762289793
+}
